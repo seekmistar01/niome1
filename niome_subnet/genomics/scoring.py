@@ -2,19 +2,12 @@
 import bittensor as bt
 import json
 import pysam
-import subprocess
 import os
+from pathlib import Path
 
 from collections import defaultdict
 from niome_subnet.genomics.model import GroundTruth, MinerScore, MinerSubmission
-
-# -----------------------------
-# Compress and index vcf
-# -----------------------------
-def preprocess_vcf(vcf_path: str) -> str:
-    subprocess.run(f"bgzip -c {vcf_path} > {vcf_path}.gz", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(f"tabix -f -p vcf {vcf_path}.gz", shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return f"{vcf_path}.gz"
+from niome_subnet.genomics.vcf_norm import normalize_vcf, preprocess_vcf
 
 
 # -----------------------------
@@ -65,51 +58,16 @@ def load_vcf(path):
     return variants
 
 
-# -----------------------------
-# 2. NORMALIZATION VIA BCFTOOLS
-# -----------------------------
-def normalize_vcf(vcf_in, ref_fai, out):
-    norm = subprocess.run(
-        [
-            "bcftools",
-            "norm",
-            "-f",
-            ref_fai,
-            "-c",
-            "s",
-            "-m",
-            "-both",
-            vcf_in,
-            "-Oz",
-            "-o",
-            out,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if norm.returncode != 0:
-        detail = (norm.stderr or norm.stdout or "").strip()
-        raise RuntimeError(
-            f"bcftools norm failed (exit {norm.returncode}) for {vcf_in}: {detail}"
-        )
-
-    index = subprocess.run(
-        ["bcftools", "index", "-f", out],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if index.returncode != 0:
-        detail = (index.stderr or index.stdout or "").strip()
-        raise RuntimeError(
-            f"bcftools index failed (exit {index.returncode}) for {out}: {detail}"
-        )
-    return out
+def _resolve_scoring_reference(ref: str) -> Path:
+    """Resolve validator ref path (often data/ref.fa) to an indexed FASTA."""
+    ref_path = Path(ref)
+    if not ref_path.is_absolute():
+        ref_path = Path.cwd() / ref_path
+    return ref_path.resolve()
 
 
 # -----------------------------
-# 3. LOAD DEPTH FROM BAM
+# 2. LOAD DEPTH FROM BAM
 # -----------------------------
 def load_depth(bam_path):
     bam = pysam.AlignmentFile(bam_path, "rb")
@@ -251,8 +209,14 @@ def score(miner_submission: MinerSubmission, ground_truth: GroundTruth, bam: str
         truth_norm = "data/truth.norm.vcf.gz"
         miner_norm = "data/miner.norm.vcf.gz"
 
-        normalize_vcf(ground_truth.truth_vcf, ground_truth.ref, truth_norm)
-        normalize_vcf(miner_vcf, ground_truth.ref, miner_norm)
+        ref_path = _resolve_scoring_reference(ground_truth.ref)
+        normalize_vcf(ground_truth.truth_vcf, ref_path, truth_norm)
+        try:
+            normalize_vcf(miner_vcf, ref_path, miner_norm)
+        except RuntimeError as norm_exc:
+            raise RuntimeError(
+                f"Miner VCF failed bcftools norm (validator would score 0): {norm_exc}"
+            ) from norm_exc
 
         # [2] Loading variants
         truth = load_vcf(truth_norm)
