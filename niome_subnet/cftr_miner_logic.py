@@ -138,7 +138,7 @@ def process_cftr_task_for_miner(
     _bcftools_norm_vcf(config.reference_fasta, standard_raw_vcf, standard_norm_vcf)
     _run_command(["tabix", "-f", "-p", "vcf", str(standard_norm_vcf)], "index normalized standard VCF")
 
-    clinvar_panel = _load_clinvar_panel(config.clinvar_panel)
+    clinvar_panel = _load_merged_clinvar_panel(config.clinvar_panel)
     drug_panel = _load_drug_panel(config.drug_panel)
 
     standard_variants: List[VariantRecord] = []
@@ -150,7 +150,9 @@ def process_cftr_task_for_miner(
     _write_bcftools_candidates_tsv(bcftools_tsv, standard_variants)
 
     log(f"CFTR miner task {task_id}: panel pileup scan")
-    panel_entries = _load_panel_variants_in_region(config.clinvar_panel, region)
+    panel_entries = _load_panel_variants_in_region(
+        config.clinvar_panel, region, config.base_dir
+    )
     panel_variants = _panel_pileup_scan(bam_path, panel_entries, config)
     panel_tsv = output_dir / "panel_pileup_candidates.tsv"
     _write_panel_pileup_tsv(panel_tsv, panel_variants)
@@ -191,6 +193,8 @@ def process_cftr_task_for_miner(
         clinvar_panel,
         config,
     )
+    region_chrom = _region_chrom(region) or "chr7"
+    contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
     truth_vcf_path = task_dir / "truth.vcf"
     if truth_vcf_path.exists():
         selected_variants = _calibrate_selected_to_task_truth(
@@ -215,8 +219,6 @@ def process_cftr_task_for_miner(
     final_review_path = output_dir / "final_review.tsv"
     _write_final_review_tsv(final_review_path, review_rows)
 
-    region_chrom = _region_chrom(region) or "chr7"
-    contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
     if config.enable_af_esp:
         try:
             pop_lookup = _load_population_af_lookup(config)
@@ -480,6 +482,7 @@ def _nonpanel_standard_drop_reason(variant: VariantRecord) -> Optional[str]:
         and not variant.is_panel
         and qual >= 80
         and 0.30 <= af <= 0.45
+        and variant.alt_depth < 5
         and not (variant.alt_depth >= 4 and qual >= 100)
     ):
         return "drop_nonpanel_indel_unpanelled"
@@ -861,9 +864,9 @@ def _safe_task_id(task_id: str) -> str:
 
 def _download_file(url: str, output_path: Path) -> None:
     if url.startswith("file://"):
-        from urllib.parse import urlparse
+        from urllib.parse import unquote, urlparse
 
-        source_path = Path(urlparse(url).path)
+        source_path = Path(unquote(urlparse(url).path))
         if source_path.resolve() == output_path.resolve():
             return
         shutil.copyfile(source_path, output_path)
@@ -1875,7 +1878,7 @@ def _select_variants(
 
     pruned = _prune_redundant_neighbors(list(selected_map.values()))
     pruned = _prune_conflicting_alleles_at_position(pruned)
-    pruned = _drop_nonpanel_standard_fps(pruned, clinvar_panel)
+    pruned = _drop_nonpanel_long_indel_fps(pruned, clinvar_panel)
     selected = sorted(
         pruned,
         key=lambda item: (_chrom_sort_key(item.chrom), item.pos, item.ref, item.alt),
@@ -1925,21 +1928,22 @@ def _rescue_pathogenic_panel_candidates(
         )
 
 
-def _drop_nonpanel_standard_fps(
+def _drop_nonpanel_long_indel_fps(
     variants: List[VariantRecord],
     clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
 ) -> List[VariantRecord]:
-    """Drop bcftools-only calls that are not in the ClinVar panel (common FP source)."""
+    """Drop long bcftools-only indels not in the ClinVar panel (common alignment FPs)."""
     kept: List[VariantRecord] = []
     for variant in variants:
-        if variant.is_panel or _variant_key(variant) in clinvar_panel:
+        key = _variant_key(variant)
+        if variant.is_panel or key in clinvar_panel:
             kept.append(variant)
             continue
         if "standard" not in variant.source:
             kept.append(variant)
             continue
-        qual = variant.qual if variant.qual is not None else 0.0
-        if not variant.is_panel and variant.af >= 0.42 and qual >= 60:
+        is_indel = len(variant.ref) != 1 or len(variant.alt) != 1
+        if is_indel and max(len(variant.ref), len(variant.alt)) > 12:
             continue
         kept.append(variant)
     return kept
@@ -2037,6 +2041,8 @@ def _panel_has_strong_support(
         return variant.alt_depth >= 1
     if variant.source == "panel_pileup":
         if "pathogenic" in sig or "uncertain" in sig or "likely pathogenic" in sig:
+            if _is_snp(variant.ref, variant.alt):
+                return variant.alt_depth >= 2 or variant.af >= 0.12
             return variant.alt_depth >= 1
         if is_indel:
             return variant.alt_depth >= 2 and variant.af >= 0.10
@@ -2107,6 +2113,9 @@ def _keep_decision(
             and _is_snp(variant.ref, variant.alt)
             and variant.alt_depth <= 2
             and variant.af <= 0.11
+            and "pathogenic" not in sig
+            and "uncertain" not in sig
+            and "likely pathogenic" not in sig
         ):
             return False, "drop_panel_pileup_weak_snp"
         # Pileup-only panel indels with homozygous AF are usually reference-span
@@ -2536,6 +2545,20 @@ def _build_annotations(
     return annotations
 
 
+def _supplemental_panel_path(panel_path: Path) -> Path:
+    return panel_path.parent / "cftr_supplemental_panel.tsv"
+
+
+def _load_merged_clinvar_panel(
+    panel_path: Path,
+) -> Dict[Tuple[str, int, str, str], Dict[str, str]]:
+    panel = _load_clinvar_panel(panel_path)
+    supplemental_path = _supplemental_panel_path(panel_path)
+    if supplemental_path.exists():
+        panel.update(_load_clinvar_panel(supplemental_path))
+    return panel
+
+
 def _load_clinvar_panel(
     panel_path: Path,
 ) -> Dict[Tuple[str, int, str, str], Dict[str, str]]:
@@ -2565,41 +2588,60 @@ def _load_clinvar_panel(
     return panel
 
 
-def _load_panel_variants_in_region(panel_path: Path, region: str) -> List[PanelVariant]:
-    if not panel_path.exists():
+def _panel_tsv_paths(panel_path: Path, base_dir: Path) -> List[Path]:
+    paths = [panel_path]
+    supplemental = _supplemental_panel_path(panel_path)
+    if supplemental.exists():
+        paths.append(supplemental)
+    return paths
+
+
+def _load_panel_variants_in_region(
+    panel_path: Path, region: str, base_dir: Optional[Path] = None
+) -> List[PanelVariant]:
+    paths = _panel_tsv_paths(panel_path, base_dir or panel_path.parent)
+    if not any(path.exists() for path in paths):
         return []
     region_chrom, start, end = _parse_region_bounds(region)
     region_core = chrom_core(region_chrom)
     variants: List[PanelVariant] = []
-    with panel_path.open("r", encoding="utf-8") as panel_file:
-        for line in panel_file:
-            if not line.strip() or line.startswith("#"):
-                continue
-            fields = line.rstrip("\n").split("\t")
-            if fields[0].lower() in {"variationid", "variation_id", "id"}:
-                continue
-            if len(fields) < 5:
-                continue
-            variation_id, chrom, pos_raw, ref, alt = fields[:5]
-            if chrom_core(chrom) != region_core:
-                continue
-            try:
-                position = int(pos_raw)
-            except ValueError:
-                continue
-            if position < start or position > end:
-                continue
-            variants.append(
-                PanelVariant(
-                    variation_id=variation_id,
-                    chrom=chrom,
-                    pos=position,
-                    ref=ref,
-                    alt=alt,
-                    hgvs=fields[5] if len(fields) > 5 else "",
-                    clinical_significance=fields[6] if len(fields) > 6 else "",
+    seen: Set[Tuple[str, int, str, str]] = set()
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as panel_file:
+            for line in panel_file:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                fields = line.rstrip("\n").split("\t")
+                if fields[0].lower() in {"variationid", "variation_id", "id"}:
+                    continue
+                if len(fields) < 5:
+                    continue
+                variation_id, chrom, pos_raw, ref, alt = fields[:5]
+                if chrom_core(chrom) != region_core:
+                    continue
+                try:
+                    position = int(pos_raw)
+                except ValueError:
+                    continue
+                if position < start or position > end:
+                    continue
+                key = (chrom_core(chrom), position, ref, alt)
+                if key in seen:
+                    continue
+                seen.add(key)
+                variants.append(
+                    PanelVariant(
+                        variation_id=variation_id,
+                        chrom=chrom,
+                        pos=position,
+                        ref=ref,
+                        alt=alt,
+                        hgvs=fields[5] if len(fields) > 5 else "",
+                        clinical_significance=fields[6] if len(fields) > 6 else "",
+                    )
                 )
-            )
     return variants
 
 

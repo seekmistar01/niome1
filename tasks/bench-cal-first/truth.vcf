@@ -1,0 +1,15 @@
+##fileformat=VCFv4.2
+##reference=data/chr7.fa
+##contig=<ID=chr7,length=159345973>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	SAMPLE
+chr7	117514266	.	A	G	.	PASS	.	GT	0/1
+chr7	117530899	.	G	A	.	PASS	.	GT	0/1
+chr7	117587802	.	G	T	.	PASS	.	GT	0/1
+chr7	117590439	.	G	A	.	PASS	.	GT	0/1
+chr7	117592515	.	T	G	.	PASS	.	GT	0/1
+chr7	117594935	.	C	A	.	PASS	.	GT	0/1
+chr7	117603582	.	A	G	.	PASS	.	GT	0/1
+chr7	117642579	.	G	T	.	PASS	.	GT	0/1
+chr7	117652038	.	A	C	.	PASS	.	GT	0/1
+chr7	117652897	.	G	A	.	PASS	.	GT	0/1

@@ -6,22 +6,11 @@
     "region": "chr7:117480000-117670000"
   },
   "input": {
-    "read1_fastq": "https://niome-data-bucket.s3.amazonaws.com/crt/reads_1.fq?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAQBOQGOVHUAS7W75G%2F20260521%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260521T012049Z&X-Amz-Expires=14400&X-Amz-SignedHeaders=host&X-Amz-Signature=3d2734e6650435895080ea4af2aa8c085f6dd160223bf7d816857d26046dcd1a",
-    "read2_fastq": "https://niome-data-bucket.s3.amazonaws.com/crt/reads_2.fq?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAQBOQGOVHUAS7W75G%2F20260521%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260521T012050Z&X-Amz-Expires=14400&X-Amz-SignedHeaders=host&X-Amz-Signature=d4dd7deffac6a8eb7a1545a6862fc3ea3ed5ea72c154f5373cad5e0a1b7cf7a3"
+    "read1_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/44e497d3-4607-42ac-96b9-8fa52aff8bc1/reads_1.fq",
+    "read2_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/44e497d3-4607-42ac-96b9-8fa52aff8bc1/reads_2.fq"
   },
   "output_spec": {
-    "format": "vcf",
-    "required_fields": [
-      "CHROM",
-      "POS",
-      "REF",
-      "ALT",
-      "QUAL",
-      "FILTER",
-      "INFO",
-      "FORMAT",
-      "SAMPLE"
-    ]
+    "format": "vcf"
   },
   "task_id": "44e497d3-4607-42ac-96b9-8fa52aff8bc1",
   "type": "cftr_variant_calling",

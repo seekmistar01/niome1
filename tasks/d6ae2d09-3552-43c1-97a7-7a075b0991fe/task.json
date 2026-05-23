@@ -6,22 +6,11 @@
     "region": "chr7:117480000-117670000"
   },
   "input": {
-    "read1_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/updatedtask_source/reads_1.fq",
-    "read2_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/updatedtask_source/reads_2.fq"
+    "read1_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/d6ae2d09-3552-43c1-97a7-7a075b0991fe/reads_1.fq",
+    "read2_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/d6ae2d09-3552-43c1-97a7-7a075b0991fe/reads_2.fq"
   },
   "output_spec": {
-    "format": "vcf",
-    "required_fields": [
-      "CHROM",
-      "POS",
-      "REF",
-      "ALT",
-      "QUAL",
-      "FILTER",
-      "INFO",
-      "FORMAT",
-      "SAMPLE"
-    ]
+    "format": "vcf"
   },
   "task_id": "d6ae2d09-3552-43c1-97a7-7a075b0991fe",
   "type": "cftr_variant_calling",

@@ -1,26 +1,16 @@
 {
-  "3766979": {
-    "hgvs": "NC_000007.14:g.117480124C>A",
-    "clinical_significance": "Uncertain significance",
+  "7181": {
+    "hgvs": "NC_000007.14:g.117530899G>A",
+    "clinical_significance": "Pathogenic",
     "drug_response": {
       "ivacaftor": "non_responsive",
-      "tezacaftor_ivacaftor": "non_responsive",
-      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
+      "tezacaftor_ivacaftor": "responsive",
+      "elexacaftor_tezacaftor_ivacaftor": "responsive",
       "lumacaftor_ivacaftor": "non_responsive"
     }
   },
-  "2704931": {
-    "hgvs": "NC_000007.14:g.117534272T>G",
-    "clinical_significance": "Likely benign",
-    "drug_response": {
-      "ivacaftor": "non_responsive",
-      "tezacaftor_ivacaftor": "non_responsive",
-      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
-      "lumacaftor_ivacaftor": "non_responsive"
-    }
-  },
-  "597514": {
-    "hgvs": "NC_000007.14:g.117536674G>C",
+  "53312": {
+    "hgvs": "NC_000007.14:g.117587802G>T",
     "clinical_significance": "Pathogenic",
     "drug_response": {
       "ivacaftor": "non_responsive",
@@ -29,38 +19,8 @@
       "lumacaftor_ivacaftor": "non_responsive"
     }
   },
-  "53338": {
-    "hgvs": "NC_000007.14:g.117589467A>G",
-    "clinical_significance": "Pathogenic",
-    "drug_response": {
-      "ivacaftor": "non_responsive",
-      "tezacaftor_ivacaftor": "non_responsive",
-      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
-      "lumacaftor_ivacaftor": "non_responsive"
-    }
-  },
-  "983583": {
-    "hgvs": "NC_000007.14:g.117602852G>A",
-    "clinical_significance": "Likely pathogenic",
-    "drug_response": {
-      "ivacaftor": "non_responsive",
-      "tezacaftor_ivacaftor": "non_responsive",
-      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
-      "lumacaftor_ivacaftor": "non_responsive"
-    }
-  },
-  "3491711": {
-    "hgvs": "NC_000007.14:g.117627676G>T",
-    "clinical_significance": "Uncertain significance",
-    "drug_response": {
-      "ivacaftor": "non_responsive",
-      "tezacaftor_ivacaftor": "non_responsive",
-      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
-      "lumacaftor_ivacaftor": "non_responsive"
-    }
-  },
-  "53820": {
-    "hgvs": "NC_000007.14:g.117642564T>C",
+  "53382": {
+    "hgvs": "NC_000007.14:g.117590439G>A",
     "clinical_significance": "Pathogenic",
     "drug_response": {
       "ivacaftor": "responsive",
@@ -69,9 +29,49 @@
       "lumacaftor_ivacaftor": "non_responsive"
     }
   },
-  "3630830": {
-    "hgvs": "NC_000007.14:g.117664803T>C",
+  "2453648": {
+    "hgvs": "NC_000007.14:g.117592515T>G",
     "clinical_significance": "Uncertain significance",
+    "drug_response": {
+      "ivacaftor": "non_responsive",
+      "tezacaftor_ivacaftor": "non_responsive",
+      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
+      "lumacaftor_ivacaftor": "non_responsive"
+    }
+  },
+  "53502": {
+    "hgvs": "NC_000007.14:g.117594935C>A",
+    "clinical_significance": "Pathogenic",
+    "drug_response": {
+      "ivacaftor": "non_responsive",
+      "tezacaftor_ivacaftor": "non_responsive",
+      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
+      "lumacaftor_ivacaftor": "non_responsive"
+    }
+  },
+  "908328": {
+    "hgvs": "NC_000007.14:g.117603582A>G",
+    "clinical_significance": "Uncertain significance",
+    "drug_response": {
+      "ivacaftor": "non_responsive",
+      "tezacaftor_ivacaftor": "non_responsive",
+      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
+      "lumacaftor_ivacaftor": "non_responsive"
+    }
+  },
+  "943683": {
+    "hgvs": "NC_000007.14:g.117642579G>T",
+    "clinical_significance": "Pathogenic",
+    "drug_response": {
+      "ivacaftor": "non_responsive",
+      "tezacaftor_ivacaftor": "non_responsive",
+      "elexacaftor_tezacaftor_ivacaftor": "non_responsive",
+      "lumacaftor_ivacaftor": "non_responsive"
+    }
+  },
+  "53856": {
+    "hgvs": "NC_000007.14:g.117652897G>A",
+    "clinical_significance": "Pathogenic",
     "drug_response": {
       "ivacaftor": "non_responsive",
       "tezacaftor_ivacaftor": "non_responsive",

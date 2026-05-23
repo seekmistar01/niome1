@@ -12,7 +12,7 @@
   "output_spec": {
     "format": "vcf"
   },
-  "task_id": "7fc3be20-cbf6-4e84-b758-bbffd4de2713",
+  "task_id": "bench-det-7fc3b",
   "type": "cftr_variant_calling",
   "version": "2.1"
 }
