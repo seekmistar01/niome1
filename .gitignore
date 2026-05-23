@@ -170,6 +170,17 @@ reads/
 work/
 outputs/
 
+# Local task scratch and files over GitHub's 100 MB limit
+tasks/New folder/
+**/ref.fa
+*.fq
+*.fq.gz
+*.fa.bwt
+*.fa.sa
+*.fa.amb
+*.fa.ann
+*.fa.pac
+
 # Editors
 .vscode/settings.json
 .idea
