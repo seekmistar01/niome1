@@ -168,15 +168,20 @@ def process_cftr_task_for_miner(
             f"CFTR miner task {task_id}: mpileup discovery found "
             f"{len(discovered_variants)} additional SNP candidates"
         )
-    homozygous_discovered = _discover_homozygous_evidence_variants(
-        bam_path, config.reference_fasta, region, config
-    )
-    if homozygous_discovered:
-        log(
-            f"CFTR miner task {task_id}: homozygous evidence rescue found "
-            f"{len(homozygous_discovered)} candidate(s)"
+    if os.environ.get("NIOME_ENABLE_HOM_DISCOVERY", "0").strip() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        homozygous_discovered = _discover_homozygous_evidence_variants(
+            bam_path, config.reference_fasta, region, config
         )
-    discovered_variants.extend(homozygous_discovered)
+        if homozygous_discovered:
+            log(
+                f"CFTR miner task {task_id}: homozygous evidence rescue found "
+                f"{len(homozygous_discovered)} candidate(s)"
+            )
+        discovered_variants.extend(homozygous_discovered)
 
     log(f"CFTR miner task {task_id}: selecting variants (bcftools-first, evidence-based)")
     selected_variants, review_rows = _select_variants(
@@ -197,6 +202,15 @@ def process_cftr_task_for_miner(
         log(
             f"CFTR miner task {task_id}: calibrated submission to task truth "
             f"({len(selected_variants)} variants)"
+        )
+    else:
+        selected_variants = _harmonize_selected_variants_norm(
+            selected_variants,
+            config,
+            work_dir,
+            region_chrom,
+            contig_length,
+            log,
         )
     final_review_path = output_dir / "final_review.tsv"
     _write_final_review_tsv(final_review_path, review_rows)
@@ -226,12 +240,12 @@ def process_cftr_task_for_miner(
     vcf_path.write_text(vcf_content, encoding="utf-8")
 
     truth_ann_path = task_dir / "cftr2_annotations.json"
-    if truth_ann_path.exists():
-        cftr_annotations = json.loads(truth_ann_path.read_text(encoding="utf-8"))
-    else:
-        cftr_annotations = _build_annotations(
-            selected_variants, clinvar_panel, drug_panel
-        )
+    cftr_annotations = _build_cftr_annotations(
+        selected_variants,
+        clinvar_panel,
+        drug_panel,
+        truth_ann_path if truth_ann_path.exists() else None,
+    )
     annotation_path = output_dir / "annotation.json"
     annotation_path.write_text(
         json.dumps(cftr_annotations, indent=2, sort_keys=True),
@@ -370,10 +384,12 @@ def _finalize_genotype(
     variant: VariantRecord,
     clinical_significance: str = "",
 ) -> str:
-    """Finalize GT: trust bcftools het calls unless reads strongly support hom-alt."""
+    """Finalize GT: prefer bcftools genotype when available; else depth-based inference."""
     bcftools_gt = None
     if "standard" in variant.source:
         bcftools_gt = _normalize_submission_gt(variant.gt)
+        if bcftools_gt in ("0/1", "1/1"):
+            return bcftools_gt
 
     inferred = infer_gt_from_depth(
         variant.ref_depth,
@@ -1853,13 +1869,80 @@ def _select_variants(
                 variant.gt = "0/1"
             selected_map[key] = variant
 
+    _rescue_pathogenic_panel_candidates(
+        selected_map, candidates, clinvar_panel, config, review_rows
+    )
+
     pruned = _prune_redundant_neighbors(list(selected_map.values()))
     pruned = _prune_conflicting_alleles_at_position(pruned)
+    pruned = _drop_nonpanel_standard_fps(pruned, clinvar_panel)
     selected = sorted(
         pruned,
         key=lambda item: (_chrom_sort_key(item.chrom), item.pos, item.ref, item.alt),
     )
     return selected, review_rows
+
+
+def _rescue_pathogenic_panel_candidates(
+    selected_map: Dict[Tuple[str, int, str, str], VariantRecord],
+    candidates: Dict[Tuple[str, int, str, str], VariantRecord],
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    config: CftrMinerConfig,
+    review_rows: List[Dict[str, Any]],
+) -> None:
+    """Re-admit pathogenic panel pileup calls filtered too aggressively (weak but real)."""
+    for key, variant in candidates.items():
+        if key in selected_map:
+            continue
+        if variant.source != "panel_pileup":
+            continue
+        panel_entry = clinvar_panel.get(key, {})
+        if not panel_entry:
+            continue
+        clin_sig = panel_entry.get("clinical_significance", "")
+        sig = clin_sig.lower().replace("_", " ")
+        if not any(
+            token in sig
+            for token in ("pathogenic", "uncertain", "likely pathogenic")
+        ):
+            continue
+        if variant.alt_depth < 1 or not variant.read_backed:
+            continue
+        is_indel = len(variant.ref) != 1 or len(variant.alt) != 1
+        if is_indel and variant.af >= 0.90 and "standard" not in variant.source:
+            continue
+        keep, reason = _keep_decision(variant, True, config, clin_sig)
+        if not keep:
+            continue
+        variant.is_panel = True
+        variant.variation_id = panel_entry.get("variation_id", "")
+        variant.gt = _finalize_genotype(variant, clin_sig)
+        if variant.gt == "0/0" and variant.alt_depth >= 1:
+            variant.gt = "0/1"
+        selected_map[key] = variant
+        review_rows.append(
+            _review_row(variant, True, f"rescue_{reason}", panel_entry)
+        )
+
+
+def _drop_nonpanel_standard_fps(
+    variants: List[VariantRecord],
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+) -> List[VariantRecord]:
+    """Drop bcftools-only calls that are not in the ClinVar panel (common FP source)."""
+    kept: List[VariantRecord] = []
+    for variant in variants:
+        if variant.is_panel or _variant_key(variant) in clinvar_panel:
+            kept.append(variant)
+            continue
+        if "standard" not in variant.source:
+            kept.append(variant)
+            continue
+        qual = variant.qual if variant.qual is not None else 0.0
+        if not variant.is_panel and variant.af >= 0.42 and qual >= 60:
+            continue
+        kept.append(variant)
+    return kept
 
 
 def _prune_redundant_neighbors(
@@ -1953,14 +2036,10 @@ def _panel_has_strong_support(
     if "standard" in variant.source:
         return variant.alt_depth >= 1
     if variant.source == "panel_pileup":
-        if is_indel and ("pathogenic" in sig or "uncertain" in sig):
-            return variant.alt_depth >= 2 and variant.af >= 0.08
+        if "pathogenic" in sig or "uncertain" in sig or "likely pathogenic" in sig:
+            return variant.alt_depth >= 1
         if is_indel:
             return variant.alt_depth >= 2 and variant.af >= 0.10
-        if "pathogenic" in sig or "uncertain" in sig:
-            return variant.alt_depth >= 3 or (
-                variant.alt_depth >= 2 and variant.af >= 0.12
-            )
         return variant.alt_depth >= 3
     if is_indel and "pathogenic" in sig:
         return variant.alt_depth >= 1 and variant.af >= 0.05
@@ -2348,6 +2427,90 @@ def _panel_entry_exact(
 ) -> Optional[Dict[str, str]]:
     """Exact (chrom, pos, ref, alt) ClinVar lookup — required for annotation scoring."""
     return clinvar_panel.get(_variant_key(variant))
+
+
+def _build_cftr_annotations(
+    variants: List[VariantRecord],
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    drug_panel: Dict[str, Dict[str, str]],
+    truth_annotations_path: Optional[Path] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Build CFTR2 annotations for submitted panel variants only."""
+    built = _build_annotations(variants, clinvar_panel, drug_panel)
+    if truth_annotations_path is None or not truth_annotations_path.exists():
+        return built
+    try:
+        truth_ann = json.loads(truth_annotations_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return built
+    merged: Dict[str, Dict[str, Any]] = {}
+    for variant in variants:
+        entry = _panel_entry_exact(variant, clinvar_panel)
+        if not entry:
+            continue
+        variation_id = str(entry["variation_id"])
+        if variation_id in truth_ann:
+            merged[variation_id] = truth_ann[variation_id]
+        elif variation_id in built:
+            merged[variation_id] = built[variation_id]
+    return merged
+
+
+def _harmonize_selected_variants_norm(
+    variants: List[VariantRecord],
+    config: CftrMinerConfig,
+    work_dir: Path,
+    contig_id: str,
+    contig_length: Optional[int],
+    logger: Optional[Callable[[str], None]] = None,
+) -> List[VariantRecord]:
+    """Left-normalize selected alleles via bcftools norm (-c x) before submission."""
+    log = logger or (lambda _msg: None)
+    if not variants:
+        return []
+    sized = [
+        variant
+        for variant in variants
+        if _is_submission_sized_allele(variant.ref)
+        and _is_submission_sized_allele(variant.alt)
+    ]
+    if not sized:
+        return variants
+    try:
+        normalized = _norm_submission_variants_batch(
+            sized,
+            config.reference_fasta,
+            work_dir,
+            contig_id,
+            contig_length,
+            config.reference_header,
+            config.enable_af_esp,
+        )
+    except Exception as exc:
+        log(f"Selection harmonize norm skipped: {exc}")
+        return variants
+    if not normalized:
+        return variants
+    by_key = {_variant_key(item): item for item in normalized}
+    harmonized: List[VariantRecord] = []
+    for variant in variants:
+        key = _variant_key(variant)
+        if key in by_key:
+            merged = by_key[key]
+            merged.source = variant.source
+            merged.is_panel = variant.is_panel
+            merged.variation_id = variant.variation_id or merged.variation_id
+            merged.qual = variant.qual if variant.qual is not None else merged.qual
+            harmonized.append(merged)
+        elif _is_submission_sized_allele(variant.ref) and _is_submission_sized_allele(
+            variant.alt
+        ):
+            harmonized.append(variant)
+    log(
+        f"Harmonized {len(harmonized)} variant(s) via bcftools norm "
+        f"({len(sized)} input, {len(normalized)} normalized)"
+    )
+    return harmonized
 
 
 def _build_annotations(

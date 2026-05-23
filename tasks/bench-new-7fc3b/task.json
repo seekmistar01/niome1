@@ -1,0 +1,13 @@
+{
+  "genome_context": {
+    "chromosome": "chr7",
+    "gene": "CFTR",
+    "region": "chr7:117480000-117670000"
+  },
+  "input": {
+    "read1_fastq": "file:///root/55miner/niome_4/subnet-niome/reads/7fc3be20-cbf6-4e84-b758-bbffd4de2713/reads_1.fq",
+    "read2_fastq": "file:///root/55miner/niome_4/subnet-niome/reads/7fc3be20-cbf6-4e84-b758-bbffd4de2713/reads_2.fq"
+  },
+  "task_id": "bench-new-7fc3b",
+  "type": "cftr_variant_calling"
+}
