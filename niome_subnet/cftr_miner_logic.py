@@ -185,6 +185,17 @@ def process_cftr_task_for_miner(
             )
         discovered_variants.extend(homozygous_discovered)
 
+    pop_lookup: Optional[PopulationAfLookup] = None
+    if config.enable_af_esp:
+        try:
+            pop_lookup = _load_population_af_lookup(config)
+            log(
+                f"CFTR miner task {task_id}: loaded gnomAD population AF cache "
+                f"({len(pop_lookup.by_allele)} alleles)"
+            )
+        except Exception as exc:
+            log(f"CFTR miner task {task_id}: population AF cache skipped: {exc}")
+
     log(f"CFTR miner task {task_id}: selecting variants (bcftools-first, evidence-based)")
     selected_variants, review_rows = _select_variants(
         standard_variants,
@@ -192,6 +203,7 @@ def process_cftr_task_for_miner(
         discovered_variants,
         clinvar_panel,
         config,
+        pop_lookup=pop_lookup,
     )
     region_chrom = _region_chrom(region) or "chr7"
     contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
@@ -215,20 +227,19 @@ def process_cftr_task_for_miner(
             region_chrom,
             contig_length,
             log,
+            clinvar_panel=clinvar_panel,
+            pop_lookup=pop_lookup,
         )
     final_review_path = output_dir / "final_review.tsv"
     _write_final_review_tsv(final_review_path, review_rows)
 
-    if config.enable_af_esp:
-        try:
-            pop_lookup = _load_population_af_lookup(config)
-            annotate_variants_with_population_af(selected_variants, pop_lookup)
-            log(
-                f"CFTR miner task {task_id}: annotated population AF "
-                f"from gnomAD ({len(pop_lookup.by_allele)} cached alleles)"
-            )
-        except Exception as exc:
-            log(f"CFTR miner task {task_id}: population AF annotation skipped: {exc}")
+    if pop_lookup is not None:
+        annotate_variants_with_population_af(selected_variants, pop_lookup)
+        _refresh_variants_genotypes(selected_variants, clinvar_panel, pop_lookup)
+        log(
+            f"CFTR miner task {task_id}: refreshed genotypes using read evidence "
+            f"and gnomAD population AF"
+        )
 
     vcf_content = _prepare_submission_vcf(
         selected_variants,
@@ -237,6 +248,8 @@ def process_cftr_task_for_miner(
         region_chrom,
         contig_length,
         log,
+        pop_lookup=pop_lookup,
+        clinvar_panel=clinvar_panel,
     )
     vcf_path = output_dir / "submission.vcf"
     vcf_path.write_text(vcf_content, encoding="utf-8")
@@ -382,16 +395,107 @@ def infer_gt_from_depth(
     return "0/1"
 
 
-def _finalize_genotype(
+def _gt_priority(gt: str) -> int:
+    normalized = (gt or "").replace("|", "/")
+    return {"1/1": 4, "1/0": 3, "0/1": 2, "0/0": 0}.get(normalized, 0)
+
+
+def _attach_population_af(
     variant: VariantRecord,
+    pop_lookup: Optional[PopulationAfLookup],
+) -> None:
+    if pop_lookup is None or variant.af_esp is not None:
+        return
+    variant.af_esp = pop_lookup.lookup(
+        variant.chrom, variant.pos, variant.ref, variant.alt
+    )
+
+
+def _is_rare_in_gnomad(af_esp: Optional[float], threshold: float = 0.03) -> bool:
+    """True when gnomAD has no entry or population AF is below threshold."""
+    return af_esp is None or af_esp < threshold
+
+
+def _promote_genotype_from_evidence(
+    variant: VariantRecord,
+    bcftools_gt: Optional[str],
     clinical_significance: str = "",
 ) -> str:
-    """Finalize GT: prefer bcftools genotype when available; else depth-based inference."""
-    bcftools_gt = None
-    if "standard" in variant.source:
-        bcftools_gt = _normalize_submission_gt(variant.gt)
-        if bcftools_gt in ("0/1", "1/1"):
-            return bcftools_gt
+    """Assign GT from sample depth/AF, bcftools call, and gnomAD population AF."""
+    is_indel = len(variant.ref) != len(variant.alt)
+    sig = clinical_significance.lower().replace("_", " ")
+    af = variant.af
+    pop_af = variant.af_esp
+    rare = _is_rare_in_gnomad(pop_af)
+    pathogenic = "pathogenic" in sig and "benign" not in sig
+
+    if bcftools_gt == "1/1":
+        return "1/1"
+    if bcftools_gt == "1/0":
+        return "1/0"
+
+    if af >= 0.90 and variant.alt_depth >= 3:
+        return "1/1"
+    if af >= 0.85 and variant.alt_depth >= 5:
+        return "1/1"
+
+    hom_af_floor = 0.58
+    if (variant.is_panel or pathogenic) and rare:
+        hom_af_floor = 0.52
+    elif variant.is_panel or pathogenic:
+        hom_af_floor = 0.55
+    if (
+        af >= hom_af_floor
+        and variant.alt_depth >= 4
+        and not (is_indel and len(variant.ref) > len(variant.alt) and len(variant.ref) >= 10)
+    ):
+        return "1/1"
+    if af >= 0.68 and variant.alt_depth >= 5:
+        return "1/1"
+    if (
+        _is_snp(variant.ref, variant.alt)
+        and variant.alt_depth >= 6
+        and af >= 0.52
+        and variant.qual is not None
+        and variant.qual >= 80
+        and (pathogenic or variant.is_panel)
+    ):
+        return "1/1"
+    if (
+        is_indel
+        and len(variant.alt) > len(variant.ref)
+        and variant.alt_depth >= 6
+        and af >= 0.55
+    ):
+        return "1/1"
+    if (
+        is_indel
+        and len(variant.alt) > len(variant.ref)
+        and variant.is_panel
+        and pathogenic
+        and variant.alt_depth >= 4
+        and af >= 0.33
+    ):
+        return "1/1"
+    if (
+        is_indel
+        and len(variant.ref) > len(variant.alt)
+        and len(variant.ref) <= 4
+        and variant.is_panel
+        and pathogenic
+        and variant.alt_depth >= 5
+        and af >= 0.35
+    ):
+        return "1/1"
+
+    if pop_af is not None and pop_af >= 0.08 and 0.28 <= af <= 0.72:
+        if bcftools_gt == "0/1":
+            return "0/1"
+
+    if bcftools_gt == "0/1":
+        if is_indel and len(variant.ref) > len(variant.alt) and len(variant.ref) >= 10:
+            return "0/1"
+        return "0/1"
 
     inferred = infer_gt_from_depth(
         variant.ref_depth,
@@ -401,63 +505,31 @@ def _finalize_genotype(
         variant.alt,
         is_panel=variant.is_panel,
     )
-    is_indel = len(variant.ref) != len(variant.alt)
-    sig = clinical_significance.lower()
-
-    if bcftools_gt == "1/1":
-        return "1/1"
-    if bcftools_gt == "0/1":
-        if variant.af >= 0.58 and variant.alt_depth >= 5:
-            if not (is_indel and len(variant.ref) > len(variant.alt) and len(variant.ref) >= 10):
-                return "1/1"
-        if (
-            _is_snp(variant.ref, variant.alt)
-            and variant.alt_depth >= 6
-            and variant.af >= 0.35
-            and variant.qual is not None
-            and variant.qual >= 80
-        ):
+    if inferred == "1/1":
+        if af >= 0.48 or (rare and af >= 0.40 and variant.alt_depth >= 3):
             return "1/1"
         if (
-            is_indel
-            and len(variant.alt) > len(variant.ref)
-            and variant.alt_depth >= 6
-            and variant.af >= 0.55
+            len(variant.ref) > len(variant.alt)
+            and af < 0.36
+            and not pathogenic
         ):
-            return "1/1"
-        if (
-            is_indel
-            and len(variant.alt) > len(variant.ref)
-            and variant.is_panel
-            and "pathogenic" in sig
-            and variant.alt_depth >= 4
-            and variant.af >= 0.33
-        ):
-            return "1/1"
-        if (
-            is_indel
-            and len(variant.ref) > len(variant.alt)
-            and len(variant.ref) <= 4
-            and variant.is_panel
-            and "pathogenic" in sig
-            and variant.alt_depth >= 5
-            and variant.af >= 0.35
-        ):
-            return "1/1"
-        if is_indel and len(variant.ref) > len(variant.alt) and len(variant.ref) >= 10:
             return "0/1"
-        return "0/1"
-
-    if (
-        inferred == "1/1"
-        and len(variant.ref) > len(variant.alt)
-        and variant.af < 0.36
-        and "pathogenic" not in sig
-    ):
-        return "0/1"
-    if inferred == "1/1" and variant.af < 0.52 and not (is_indel and variant.alt_depth >= 3):
-        return "0/1"
+        if af < 0.52 and not (is_indel and variant.alt_depth >= 3):
+            return "0/1"
     return inferred
+
+
+def _finalize_genotype(
+    variant: VariantRecord,
+    clinical_significance: str = "",
+    pop_lookup: Optional[PopulationAfLookup] = None,
+) -> str:
+    """Finalize GT using bcftools, read depth/AF, and optional gnomAD population AF."""
+    _attach_population_af(variant, pop_lookup)
+    bcftools_gt = None
+    if "standard" in variant.source:
+        bcftools_gt = _normalize_submission_gt(variant.gt)
+    return _promote_genotype_from_evidence(variant, bcftools_gt, clinical_significance)
 
 
 def _nonpanel_standard_drop_reason(variant: VariantRecord) -> Optional[str]:
@@ -496,21 +568,29 @@ def _nonpanel_standard_drop_reason(variant: VariantRecord) -> Optional[str]:
 
 
 def _merged_genotype(existing: VariantRecord, incoming: VariantRecord) -> str:
-    """When merging panel pileup with bcftools, keep the bcftools genotype."""
+    """When merging panel pileup with bcftools, prefer the stronger genotype call."""
+    candidates: List[str] = []
     for record in (existing, incoming):
         if "standard" in record.source:
-            gt = (record.gt or "").replace("|", "/")
+            gt = _normalize_submission_gt(record.gt)
             if gt and gt not in ("0/0", "./."):
-                return gt
+                candidates.append(gt)
     primary = existing if existing.alt_depth >= incoming.alt_depth else incoming
     secondary = incoming if primary is existing else existing
-    return infer_gt_from_depth(
-        primary.ref_depth,
-        primary.alt_depth,
-        ref=primary.ref,
-        alt=primary.alt,
-        is_panel=primary.is_panel or secondary.is_panel,
+    candidates.append(
+        infer_gt_from_depth(
+            primary.ref_depth,
+            primary.alt_depth,
+            ref=primary.ref,
+            alt=primary.alt,
+            is_panel=primary.is_panel or secondary.is_panel,
+        )
     )
+    best = candidates[0]
+    for gt in candidates[1:]:
+        if _gt_priority(gt) > _gt_priority(best):
+            best = gt
+    return best
 
 
 def count_indel_support_with_pysam(
@@ -1073,10 +1153,41 @@ def _compress_and_index_vcf(vcf_path: Path) -> Path:
     return gz_path
 
 
+def _build_gt_fallback_maps(
+    variants: List[VariantRecord],
+) -> Tuple[
+    Dict[Tuple[str, int, str, str], str],
+    Dict[Tuple[str, int], str],
+    Dict[Tuple[str, int], VariantRecord],
+]:
+    """Exact-allele GT map plus per-position best GT and richest evidence record."""
+    by_key: Dict[Tuple[str, int, str, str], str] = {}
+    by_pos: Dict[Tuple[str, int], str] = {}
+    evidence_by_pos: Dict[Tuple[str, int], VariantRecord] = {}
+    for item in variants:
+        key = _variant_key(item)
+        gt = _normalize_submission_gt(item.gt) or item.gt
+        if gt and gt not in (".", "./.", "0/0"):
+            by_key[key] = gt
+        pos_key = (chrom_core(item.chrom), item.pos)
+        if gt and gt not in (".", "./.", "0/0"):
+            current = by_pos.get(pos_key)
+            if current is None or _gt_priority(gt) > _gt_priority(current):
+                by_pos[pos_key] = gt
+        existing = evidence_by_pos.get(pos_key)
+        if existing is None or item.alt_depth > existing.alt_depth:
+            evidence_by_pos[pos_key] = item
+    return by_key, by_pos, evidence_by_pos
+
+
 def _parse_submission_norm_vcf(
     vcf_path: Path,
     gt_fallback: Dict[Tuple[str, int, str, str], str],
     af_esp_fallback: Optional[Dict[Tuple[str, int, str, str], float]] = None,
+    gt_pos_fallback: Optional[Dict[Tuple[str, int], str]] = None,
+    evidence_pos_fallback: Optional[Dict[Tuple[str, int], VariantRecord]] = None,
+    pop_lookup: Optional[PopulationAfLookup] = None,
+    clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
 ) -> List[VariantRecord]:
     records: List[VariantRecord] = []
     opener = gzip.open if str(vcf_path).endswith(".gz") else open
@@ -1091,26 +1202,56 @@ def _parse_submission_norm_vcf(
             fmt_map = dict(zip(fmt.split(":"), sample.split(":")))
             norm_gt = (fmt_map.get("GT") or "./.").replace("|", "/")
             key = (chrom_core(chrom), int(pos), ref, alt)
+            pos_key = (chrom_core(chrom), int(pos))
             gt = gt_fallback.get(key)
+            if (not gt or gt in (".", "./.", "0/0")) and gt_pos_fallback:
+                gt = gt_pos_fallback.get(pos_key)
             if not gt or gt in (".", "./.", "0/0"):
                 gt = norm_gt if norm_gt not in (".", "./.", "0/0") else "0/1"
             af_esp = _af_esp_from_info(info)
             if af_esp is None and af_esp_fallback:
                 af_esp = af_esp_fallback.get(key)
-            records.append(
-                VariantRecord(
-                    chrom=_vcf_chrom(chrom),
-                    pos=int(pos),
-                    ref=ref,
-                    alt=alt,
-                    filter_value=filt,
-                    gt=gt,
-                    source="submission_norm",
-                    read_backed=True,
-                    af_esp=af_esp,
-                )
+            record = VariantRecord(
+                chrom=_vcf_chrom(chrom),
+                pos=int(pos),
+                ref=ref,
+                alt=alt,
+                filter_value=filt,
+                gt=gt,
+                source="submission_norm",
+                read_backed=True,
+                af_esp=af_esp,
             )
+            if evidence_pos_fallback and pos_key in evidence_pos_fallback:
+                evidence = evidence_pos_fallback[pos_key]
+                record.ref_depth = evidence.ref_depth
+                record.alt_depth = evidence.alt_depth
+                record.af = evidence.af
+                record.dp = evidence.dp
+                record.qual = evidence.qual
+                record.is_panel = evidence.is_panel
+                record.source = evidence.source
+                if record.af_esp is None:
+                    record.af_esp = evidence.af_esp
+                panel_entry = (clinvar_panel or {}).get(_variant_key(record), {})
+                clin_sig = panel_entry.get("clinical_significance", "")
+                record.gt = _finalize_genotype(record, clin_sig, pop_lookup)
+            records.append(record)
     return records
+
+
+def _refresh_variants_genotypes(
+    variants: List[VariantRecord],
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    pop_lookup: Optional[PopulationAfLookup] = None,
+) -> None:
+    """Re-assign GT from read depth/AF and gnomAD after merges or normalization."""
+    for variant in variants:
+        panel_entry = clinvar_panel.get(_variant_key(variant), {})
+        clin_sig = panel_entry.get("clinical_significance", "")
+        variant.gt = _finalize_genotype(variant, clin_sig, pop_lookup)
+        if variant.gt == "0/0" and variant.alt_depth >= 1:
+            variant.gt = "0/1"
 
 
 def _norm_submission_variants_batch(
@@ -1121,9 +1262,11 @@ def _norm_submission_variants_batch(
     contig_length: Optional[int],
     reference_header: str,
     include_af_esp: bool,
+    pop_lookup: Optional[PopulationAfLookup] = None,
+    clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
 ) -> List[VariantRecord]:
     """Normalize all submission variants in one bcftools pass (-c x, validator style)."""
-    gt_fallback = {_variant_key(item): item.gt for item in variants}
+    gt_fallback, gt_pos_fallback, evidence_by_pos = _build_gt_fallback_maps(variants)
     af_esp_fallback = {
         _variant_key(item): item.af_esp for item in variants if item.af_esp is not None
     }
@@ -1141,7 +1284,13 @@ def _norm_submission_variants_batch(
     raw_gz = _compress_and_index_vcf(raw_vcf)
     _bcftools_norm_vcf(reference_fasta, raw_gz, norm_vcf, check_mode="x")
     return _parse_submission_norm_vcf(
-        norm_vcf, gt_fallback, af_esp_fallback=af_esp_fallback or None
+        norm_vcf,
+        gt_fallback,
+        af_esp_fallback=af_esp_fallback or None,
+        gt_pos_fallback=gt_pos_fallback,
+        evidence_pos_fallback=evidence_by_pos,
+        pop_lookup=pop_lookup,
+        clinvar_panel=clinvar_panel,
     )
 
 
@@ -1154,6 +1303,8 @@ def _norm_submission_variants_individually(
     reference_header: str,
     include_af_esp: bool,
     logger: Optional[Callable[[str], None]] = None,
+    pop_lookup: Optional[PopulationAfLookup] = None,
+    clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
 ) -> List[VariantRecord]:
     """Fallback: norm one variant at a time so one bad record cannot break the batch."""
     log = logger or (lambda _msg: None)
@@ -1175,14 +1326,22 @@ def _norm_submission_variants_individually(
         try:
             single_gz = _compress_and_index_vcf(single_vcf)
             _bcftools_norm_vcf(reference_fasta, single_gz, single_norm, check_mode="x")
-            gt_fallback = {_variant_key(variant): variant.gt}
+            gt_fallback, gt_pos_fallback, evidence_by_pos = _build_gt_fallback_maps(
+                [variant]
+            )
             af_fallback = (
                 {_variant_key(variant): variant.af_esp}
                 if variant.af_esp is not None
                 else None
             )
             records = _parse_submission_norm_vcf(
-                single_norm, gt_fallback, af_esp_fallback=af_fallback
+                single_norm,
+                gt_fallback,
+                af_esp_fallback=af_fallback,
+                gt_pos_fallback=gt_pos_fallback,
+                evidence_pos_fallback=evidence_by_pos,
+                pop_lookup=pop_lookup,
+                clinvar_panel=clinvar_panel,
             )
             if records:
                 normalized.extend(records)
@@ -1201,6 +1360,8 @@ def _prepare_submission_vcf(
     contig_id: str,
     contig_length: Optional[int],
     logger: Optional[Callable[[str], None]] = None,
+    pop_lookup: Optional[PopulationAfLookup] = None,
+    clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
 ) -> str:
     """Build a validator-safe submission VCF (reference-checked + bcftools norm -c x)."""
     log = logger or (lambda _msg: None)
@@ -1237,6 +1398,8 @@ def _prepare_submission_vcf(
             contig_length,
             config.reference_header,
             include_af_esp,
+            pop_lookup=pop_lookup,
+            clinvar_panel=clinvar_panel,
         )
     except Exception as exc:
         log(f"Batch submission bcftools norm failed ({exc}); retrying per-variant")
@@ -1249,6 +1412,8 @@ def _prepare_submission_vcf(
             config.reference_header,
             include_af_esp,
             logger=log,
+            pop_lookup=pop_lookup,
+            clinvar_panel=clinvar_panel,
         )
 
     if len(normalized) < len(validated):
@@ -1260,6 +1425,8 @@ def _prepare_submission_vcf(
         f"Submission VCF normalized: {len(validated)} validated -> "
         f"{len(normalized)} after bcftools norm -c x"
     )
+    if clinvar_panel is not None:
+        _refresh_variants_genotypes(normalized, clinvar_panel, pop_lookup)
     return _export_validator_safe_vcf(
         normalized,
         config.reference_fasta,
@@ -1269,6 +1436,8 @@ def _prepare_submission_vcf(
         contig_length,
         include_af_esp,
         log,
+        pop_lookup=pop_lookup,
+        clinvar_panel=clinvar_panel,
     )
 
 
@@ -1281,6 +1450,8 @@ def _export_validator_safe_vcf(
     contig_length: Optional[int],
     include_af_esp: bool,
     logger: Optional[Callable[[str], None]] = None,
+    pop_lookup: Optional[PopulationAfLookup] = None,
+    clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
 ) -> str:
     """Run the same bcftools norm -c x path the validator uses; rebuild VCF from output."""
     log = logger or (lambda _msg: None)
@@ -1296,7 +1467,7 @@ def _export_validator_safe_vcf(
     norm_vcf = work_dir / "submission.validator_export.norm.vcf.gz"
     check_vcf.write_text(draft, encoding="utf-8")
 
-    gt_fallback = {_variant_key(item): item.gt for item in variants}
+    gt_fallback, gt_pos_fallback, evidence_by_pos = _build_gt_fallback_maps(variants)
     af_fallback = {
         _variant_key(item): item.af_esp
         for item in variants
@@ -1307,7 +1478,13 @@ def _export_validator_safe_vcf(
         gz_path = preprocess_vcf(check_vcf)
         normalize_vcf(gz_path, reference_fasta, norm_vcf)
         safe_variants = _parse_submission_norm_vcf(
-            norm_vcf, gt_fallback, af_esp_fallback=af_fallback or None
+            norm_vcf,
+            gt_fallback,
+            af_esp_fallback=af_fallback or None,
+            gt_pos_fallback=gt_pos_fallback,
+            evidence_pos_fallback=evidence_by_pos,
+            pop_lookup=pop_lookup,
+            clinvar_panel=clinvar_panel,
         )
         if not safe_variants:
             raise RuntimeError("validator norm produced zero variants")
@@ -1829,6 +2006,7 @@ def _select_variants(
     discovered_variants: List[VariantRecord],
     clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
     config: CftrMinerConfig,
+    pop_lookup: Optional[PopulationAfLookup] = None,
 ) -> Tuple[List[VariantRecord], List[Dict[str, Any]]]:
     review_rows: List[Dict[str, Any]] = []
     candidates: Dict[Tuple[str, int, str, str], VariantRecord] = {}
@@ -1867,17 +2045,18 @@ def _select_variants(
         keep, reason = _keep_decision(variant, is_panel, config, clin_sig)
         review_rows.append(_review_row(variant, keep, reason, panel_entry))
         if keep:
-            variant.gt = _finalize_genotype(variant, clin_sig)
+            variant.gt = _finalize_genotype(variant, clin_sig, pop_lookup)
             if variant.gt == "0/0" and variant.alt_depth >= 1:
                 variant.gt = "0/1"
             selected_map[key] = variant
 
     _rescue_pathogenic_panel_candidates(
-        selected_map, candidates, clinvar_panel, config, review_rows
+        selected_map, candidates, clinvar_panel, config, review_rows, pop_lookup
     )
 
     pruned = _prune_redundant_neighbors(list(selected_map.values()))
     pruned = _prune_conflicting_alleles_at_position(pruned)
+    _refresh_variants_genotypes(pruned, clinvar_panel, pop_lookup)
     pruned = _drop_nonpanel_long_indel_fps(pruned, clinvar_panel)
     selected = sorted(
         pruned,
@@ -1892,6 +2071,7 @@ def _rescue_pathogenic_panel_candidates(
     clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
     config: CftrMinerConfig,
     review_rows: List[Dict[str, Any]],
+    pop_lookup: Optional[PopulationAfLookup] = None,
 ) -> None:
     """Re-admit pathogenic panel pileup calls filtered too aggressively (weak but real)."""
     for key, variant in candidates.items():
@@ -1919,7 +2099,7 @@ def _rescue_pathogenic_panel_candidates(
             continue
         variant.is_panel = True
         variant.variation_id = panel_entry.get("variation_id", "")
-        variant.gt = _finalize_genotype(variant, clin_sig)
+        variant.gt = _finalize_genotype(variant, clin_sig, pop_lookup)
         if variant.gt == "0/0" and variant.alt_depth >= 1:
             variant.gt = "0/1"
         selected_map[key] = variant
@@ -2012,9 +2192,11 @@ def _prune_conflicting_alleles_at_position(
         pos_key = (chrom_core(variant.chrom), variant.pos)
         by_pos.setdefault(pos_key, []).append(variant)
 
-    def _position_conflict_rank(item: VariantRecord) -> Tuple[int, int, int, int]:
+    def _position_conflict_rank(item: VariantRecord) -> Tuple[int, int, int, int, int]:
         source_rank = 2 if "standard" in item.source else (1 if item.is_panel else 0)
-        return (source_rank, len(item.ref), item.alt_depth, item.dp)
+        gt_rank = _gt_priority(item.gt or "")
+        af_scaled = int(item.af * 1000)
+        return (gt_rank, af_scaled, source_rank, item.alt_depth, item.dp)
 
     kept: List[VariantRecord] = []
     for group in by_pos.values():
@@ -2472,6 +2654,8 @@ def _harmonize_selected_variants_norm(
     contig_id: str,
     contig_length: Optional[int],
     logger: Optional[Callable[[str], None]] = None,
+    clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
+    pop_lookup: Optional[PopulationAfLookup] = None,
 ) -> List[VariantRecord]:
     """Left-normalize selected alleles via bcftools norm (-c x) before submission."""
     log = logger or (lambda _msg: None)
@@ -2494,6 +2678,8 @@ def _harmonize_selected_variants_norm(
             contig_length,
             config.reference_header,
             config.enable_af_esp,
+            pop_lookup=pop_lookup,
+            clinvar_panel=clinvar_panel,
         )
     except Exception as exc:
         log(f"Selection harmonize norm skipped: {exc}")
@@ -2510,11 +2696,19 @@ def _harmonize_selected_variants_norm(
             merged.is_panel = variant.is_panel
             merged.variation_id = variant.variation_id or merged.variation_id
             merged.qual = variant.qual if variant.qual is not None else merged.qual
+            merged.ref_depth = variant.ref_depth
+            merged.alt_depth = variant.alt_depth
+            merged.af = variant.af
+            merged.dp = variant.dp
+            if variant.af_esp is not None:
+                merged.af_esp = variant.af_esp
             harmonized.append(merged)
         elif _is_submission_sized_allele(variant.ref) and _is_submission_sized_allele(
             variant.alt
         ):
             harmonized.append(variant)
+    if clinvar_panel is not None:
+        _refresh_variants_genotypes(harmonized, clinvar_panel, pop_lookup)
     log(
         f"Harmonized {len(harmonized)} variant(s) via bcftools norm "
         f"({len(sized)} input, {len(normalized)} normalized)"
