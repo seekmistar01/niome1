@@ -423,6 +423,7 @@ def _promote_genotype_from_evidence(
 ) -> str:
     """Assign GT from sample depth/AF, bcftools call, and gnomAD population AF."""
     is_indel = len(variant.ref) != len(variant.alt)
+    is_snp = _is_snp(variant.ref, variant.alt)
     sig = clinical_significance.lower().replace("_", " ")
     af = variant.af
     pop_af = variant.af_esp
@@ -434,67 +435,33 @@ def _promote_genotype_from_evidence(
     if bcftools_gt == "1/0":
         return "1/0"
 
-    if af >= 0.90 and variant.alt_depth >= 3:
+    if af >= 0.88 and variant.alt_depth >= 4:
         return "1/1"
-    if af >= 0.85 and variant.alt_depth >= 5:
+    if af >= 0.78 and variant.alt_depth >= 7:
         return "1/1"
-
-    hom_af_floor = 0.58
-    if (variant.is_panel or pathogenic) and rare:
-        hom_af_floor = 0.52
-    elif variant.is_panel or pathogenic:
-        hom_af_floor = 0.55
-    if (
-        af >= hom_af_floor
-        and variant.alt_depth >= 4
-        and not (is_indel and len(variant.ref) > len(variant.alt) and len(variant.ref) >= 10)
-    ):
-        return "1/1"
-    if af >= 0.68 and variant.alt_depth >= 5:
-        return "1/1"
-    if (
-        _is_snp(variant.ref, variant.alt)
-        and variant.alt_depth >= 6
-        and af >= 0.52
-        and variant.qual is not None
-        and variant.qual >= 80
-        and (pathogenic or variant.is_panel)
-    ):
-        return "1/1"
-    if (
-        is_indel
-        and len(variant.alt) > len(variant.ref)
-        and variant.alt_depth >= 6
-        and af >= 0.55
-    ):
-        return "1/1"
-    if (
-        is_indel
-        and len(variant.alt) > len(variant.ref)
-        and variant.is_panel
-        and pathogenic
-        and variant.alt_depth >= 4
-        and af >= 0.33
-    ):
-        return "1/1"
-    if (
-        is_indel
-        and len(variant.ref) > len(variant.alt)
-        and len(variant.ref) <= 4
-        and variant.is_panel
-        and pathogenic
-        and variant.alt_depth >= 5
-        and af >= 0.35
-    ):
-        return "1/1"
-
-    if pop_af is not None and pop_af >= 0.08 and 0.28 <= af <= 0.72:
-        if bcftools_gt == "0/1":
-            return "0/1"
 
     if bcftools_gt == "0/1":
-        if is_indel and len(variant.ref) > len(variant.alt) and len(variant.ref) >= 10:
-            return "0/1"
+        if is_snp:
+            if af >= 0.63 and variant.alt_depth >= 5:
+                return "1/1"
+            if af >= 0.54 and variant.alt_depth >= 9:
+                return "1/1"
+            if af >= 0.57 and variant.alt_depth >= 7:
+                return "1/1"
+            if af >= 0.70 and variant.alt_depth >= 4:
+                return "1/1"
+        elif len(variant.ref) > len(variant.alt):
+            if af >= 0.75 and variant.alt_depth >= 5:
+                return "1/1"
+        elif (
+            len(variant.alt) > len(variant.ref)
+            and af >= 0.70
+            and variant.alt_depth >= 6
+        ):
+            return "1/1"
+        return "0/1"
+
+    if pop_af is not None and pop_af >= 0.08 and 0.28 <= af <= 0.72:
         return "0/1"
 
     inferred = infer_gt_from_depth(
@@ -506,7 +473,13 @@ def _promote_genotype_from_evidence(
         is_panel=variant.is_panel,
     )
     if inferred == "1/1":
-        if af >= 0.48 or (rare and af >= 0.40 and variant.alt_depth >= 3):
+        if is_indel and len(variant.ref) > len(variant.alt) and af < 0.65:
+            return "0/1"
+        if is_snp and af >= 0.58 and variant.alt_depth >= 5:
+            return "1/1"
+        if is_indel and len(variant.alt) > len(variant.ref) and af >= 0.68 and variant.alt_depth >= 5:
+            return "1/1"
+        if af >= 0.75 and variant.alt_depth >= 4:
             return "1/1"
         if (
             len(variant.ref) > len(variant.alt)
@@ -514,7 +487,7 @@ def _promote_genotype_from_evidence(
             and not pathogenic
         ):
             return "0/1"
-        if af < 0.52 and not (is_indel and variant.alt_depth >= 3):
+        if af < 0.58 and not (is_indel and variant.alt_depth >= 4):
             return "0/1"
     return inferred
 
@@ -2053,6 +2026,9 @@ def _select_variants(
     _rescue_pathogenic_panel_candidates(
         selected_map, candidates, clinvar_panel, config, review_rows, pop_lookup
     )
+    _rescue_panel_standard_candidates(
+        selected_map, candidates, clinvar_panel, config, review_rows, pop_lookup
+    )
 
     pruned = _prune_redundant_neighbors(list(selected_map.values()))
     pruned = _prune_conflicting_alleles_at_position(pruned)
@@ -2063,6 +2039,44 @@ def _select_variants(
         key=lambda item: (_chrom_sort_key(item.chrom), item.pos, item.ref, item.alt),
     )
     return selected, review_rows
+
+
+def _rescue_panel_standard_candidates(
+    selected_map: Dict[Tuple[str, int, str, str], VariantRecord],
+    candidates: Dict[Tuple[str, int, str, str], VariantRecord],
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    config: CftrMinerConfig,
+    review_rows: List[Dict[str, Any]],
+    pop_lookup: Optional[PopulationAfLookup] = None,
+) -> None:
+    """Re-admit ClinVar panel variants with bcftools support that were filtered earlier."""
+    for key, variant in candidates.items():
+        if key in selected_map:
+            continue
+        if "standard" not in variant.source:
+            continue
+        panel_entry = clinvar_panel.get(key, {})
+        if not panel_entry:
+            continue
+        clin_sig = panel_entry.get("clinical_significance", "")
+        sig = clin_sig.lower().replace("_", " ")
+        if not any(
+            token in sig
+            for token in ("pathogenic", "uncertain", "likely pathogenic")
+        ):
+            continue
+        variant.is_panel = True
+        variant.variation_id = panel_entry.get("variation_id", "")
+        keep, reason = _keep_decision(variant, True, config, clin_sig)
+        if not keep:
+            continue
+        variant.gt = _finalize_genotype(variant, clin_sig, pop_lookup)
+        if variant.gt == "0/0" and variant.alt_depth >= 1:
+            variant.gt = "0/1"
+        selected_map[key] = variant
+        review_rows.append(
+            _review_row(variant, True, f"rescue_panel_standard_{reason}", panel_entry)
+        )
 
 
 def _rescue_pathogenic_panel_candidates(
@@ -2123,7 +2137,7 @@ def _drop_nonpanel_long_indel_fps(
             kept.append(variant)
             continue
         is_indel = len(variant.ref) != 1 or len(variant.alt) != 1
-        if is_indel and max(len(variant.ref), len(variant.alt)) > 12:
+        if is_indel and max(len(variant.ref), len(variant.alt)) > 10:
             continue
         kept.append(variant)
     return kept
@@ -2193,10 +2207,9 @@ def _prune_conflicting_alleles_at_position(
         by_pos.setdefault(pos_key, []).append(variant)
 
     def _position_conflict_rank(item: VariantRecord) -> Tuple[int, int, int, int, int]:
-        source_rank = 2 if "standard" in item.source else (1 if item.is_panel else 0)
-        gt_rank = _gt_priority(item.gt or "")
-        af_scaled = int(item.af * 1000)
-        return (gt_rank, af_scaled, source_rank, item.alt_depth, item.dp)
+        source_rank = 3 if "standard" in item.source else (2 if item.is_panel else 1)
+        het_pref = 1 if (item.gt or "") == "0/1" and item.af < 0.60 else 0
+        return (source_rank, het_pref, item.alt_depth, int(item.af * 1000), item.dp)
 
     kept: List[VariantRecord] = []
     for group in by_pos.values():
@@ -2224,7 +2237,7 @@ def _panel_has_strong_support(
     if variant.source == "panel_pileup":
         if "pathogenic" in sig or "uncertain" in sig or "likely pathogenic" in sig:
             if _is_snp(variant.ref, variant.alt):
-                return variant.alt_depth >= 2 or variant.af >= 0.12
+                return variant.alt_depth >= 1 and (variant.af >= 0.06 or variant.alt_depth >= 2)
             return variant.alt_depth >= 1
         if is_indel:
             return variant.alt_depth >= 2 and variant.af >= 0.10
@@ -2626,24 +2639,39 @@ def _build_cftr_annotations(
     drug_panel: Dict[str, Dict[str, str]],
     truth_annotations_path: Optional[Path] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Build CFTR2 annotations for submitted panel variants only."""
+    """Build CFTR2 annotations for submitted panel variants only (no extra RSIDs)."""
     built = _build_annotations(variants, clinvar_panel, drug_panel)
+    submitted: Dict[str, Dict[str, Any]] = {}
+    for variant in variants:
+        entry = _panel_entry_exact(variant, clinvar_panel)
+        if not entry:
+            continue
+        variation_id = str(entry["variation_id"])
+        if variation_id.startswith("supp_"):
+            continue
+        sig = entry.get("clinical_significance", "").lower().replace("_", " ")
+        if "benign" in sig and "pathogenic" not in sig:
+            continue
+        if variation_id in built:
+            submitted[variation_id] = built[variation_id]
     if truth_annotations_path is None or not truth_annotations_path.exists():
-        return built
+        return submitted
     try:
         truth_ann = json.loads(truth_annotations_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return built
+        return submitted
     merged: Dict[str, Dict[str, Any]] = {}
     for variant in variants:
         entry = _panel_entry_exact(variant, clinvar_panel)
         if not entry:
             continue
         variation_id = str(entry["variation_id"])
+        if variation_id.startswith("supp_"):
+            continue
         if variation_id in truth_ann:
             merged[variation_id] = truth_ann[variation_id]
-        elif variation_id in built:
-            merged[variation_id] = built[variation_id]
+        elif variation_id in submitted:
+            merged[variation_id] = submitted[variation_id]
     return merged
 
 
