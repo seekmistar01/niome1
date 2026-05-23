@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 from niome_subnet.cftr_miner_logic import process_cftr_task_for_miner
@@ -66,10 +65,7 @@ def _setup_task(
     reads_dir: Path,
     read1: str | None,
     read2: str | None,
-    truth_vcf: Path,
-    ann_path: Path,
     task_id: str,
-    use_truth_bundle: bool,
 ) -> Path:
     task_dir = BASE / "tasks" / task_id
     reads_out = BASE / "reads" / task_id
@@ -112,10 +108,6 @@ def _setup_task(
     (task_dir / "task.json").write_text(
         json.dumps(task, indent=2, sort_keys=True), encoding="utf-8"
     )
-
-    if use_truth_bundle:
-        shutil.copy2(truth_vcf, task_dir / "truth.vcf")
-        shutil.copy2(ann_path, task_dir / "cftr2_annotations.json")
 
     return task_dir / "task.json"
 
@@ -170,28 +162,13 @@ def main() -> None:
 
     for name, spec in DATASETS.items():
         reads_dir, r1, r2, truth_vcf, ann_path, task_id = spec
-        det_id = f"bench-det-{name}"
-        cal_id = task_id if task_id.startswith(("7fc3", "d6ae", "44e4")) else f"bench-cal-{name}"
-
-        det_json = _setup_task(
-            name, reads_dir, r1, r2, truth_vcf, ann_path, det_id, use_truth_bundle=False
-        )
-        cal_json = _setup_task(
-            name, reads_dir, r1, r2, truth_vcf, ann_path, cal_id, use_truth_bundle=True
-        )
-
-        det = _run_and_score(
-            det_json, det_id, f"{name}/detection", truth_vcf, ann_path
-        )
-        cal = _run_and_score(
-            cal_json, cal_id, f"{name}/calibrated", truth_vcf, ann_path
-        )
-        rows.extend([det, cal])
+        task_json = _setup_task(name, reads_dir, r1, r2, task_id)
+        row = _run_and_score(task_json, task_id, name, truth_vcf, ann_path)
+        rows.append(row)
         print(
-            f"{name}: detection final={det.get('final', 'n/a')} "
-            f"({det.get('submitted', '?')} vars) | "
-            f"calibrated final={cal.get('final', 'n/a')} "
-            f"({cal.get('submitted', '?')} vars)"
+            f"{name}: final={row.get('final', 'n/a')} "
+            f"vcf={row.get('vcf', 'n/a')} ann={row.get('ann', 'n/a')} "
+            f"({row.get('submitted', '?')} vars)"
         )
 
     out = BASE / "outputs" / "bench_new_folder_v2_summary.json"

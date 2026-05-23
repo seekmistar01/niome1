@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT="/root/55miner/niome_1/subnet-niome"
 PY="/root/.pyenv/versions/3.10.9/bin/python"
+GATK="${NIOME_GATK:-/root/manualtest_55/gatk-4.6.2.0/gatk}"
+CALLER="${NIOME_CALLER:-gatk}"
 
 cd "$ROOT"
 mkdir -p logs
@@ -17,7 +19,7 @@ start_one() {
   local name="$1"
   shift
   screen -dmS "$name" bash -lc \
-    "cd $ROOT && export PYTHONPATH=\$(pwd) && exec $PY neurons/miner.py $* >> logs/${name}.log 2>&1"
+    "cd $ROOT && export PYTHONPATH=\$(pwd) NIOME_GATK=$GATK NIOME_CALLER=$CALLER && exec $PY neurons/miner.py $* >> logs/${name}.log 2>&1"
 }
 
 start_one niome_m1 \

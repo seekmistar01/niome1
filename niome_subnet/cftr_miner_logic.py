@@ -1,8 +1,8 @@
 """CFTR variant-calling workflow used by the subnet 55 miner.
 
-Variants are called from FASTQ/BAM read evidence. The ClinVar panel drives
-read-backed panel rescue and post-hoc annotation; variants are not emitted
-without ALT read support.
+Primary variant discovery uses GATK (bwa mem, MarkDuplicates, HaplotypeCaller)
+on the CFTR region. Genotypes are refined with gnomAD population AF and read
+depth; ClinVar panel membership drives panel rescue and annotation.json output.
 """
 
 from __future__ import annotations
@@ -122,32 +122,64 @@ def process_cftr_task_for_miner(
 
     for tool in ("bwa", "samtools", "bcftools", "tabix"):
         _ensure_executable(tool)
+    if _use_gatk_caller(config) and not config.gatk_path.exists():
+        raise FileNotFoundError(f"GATK executable not found: {config.gatk_path}")
     if not config.reference_fasta.exists():
         raise FileNotFoundError(f"Reference FASTA not found: {config.reference_fasta}")
 
-    bam_path = work_dir / "aligned.bam"
-    log(f"CFTR miner task {task_id}: aligning reads with bwa mem")
-    _align_reads(config, read1_path, read2_path, bam_path)
-    _run_command(["samtools", "index", str(bam_path)], "index BAM")
+    log(f"CFTR miner task {task_id}: preparing reference indexes")
+    _ensure_reference_indexes(config, log)
 
+    log(
+        f"CFTR miner task {task_id}: aligning reads (bwa mem) and "
+        f"preprocessing BAM (GATK RG + MarkDuplicates)"
+    )
+    dedup_bam = _prepare_dedup_bam_from_reads(
+        config, read1_path, read2_path, work_dir, safe_task_id, log
+    )
+    bam_path = work_dir / "aligned.bam"
+    if not bam_path.exists():
+        try:
+            bam_path.symlink_to(dedup_bam.resolve())
+        except OSError:
+            shutil.copy2(dedup_bam, bam_path)
+            _run_command(["samtools", "index", str(bam_path)], "index aligned BAM copy")
+
+    caller_raw_vcf = work_dir / "calls.gatk.raw.vcf.gz"
+    caller_plain_vcf = work_dir / "calls.gatk.vcf"
     standard_raw_vcf = work_dir / "calls.standard.raw.vcf.gz"
     standard_norm_vcf = work_dir / "calls.standard.norm.vcf.gz"
-    log(f"CFTR miner task {task_id}: calling standard variants in {region}")
-    _call_standard_variants(config, bam_path, region, standard_raw_vcf)
-    _run_command(["tabix", "-f", "-p", "vcf", str(standard_raw_vcf)], "index raw standard VCF")
+    caller_source = "gatk"
+
+    if _use_gatk_caller(config):
+        log(f"CFTR miner task {task_id}: GATK HaplotypeCaller in {region}")
+        _call_gatk_haplotypecaller(config, dedup_bam, region, caller_raw_vcf)
+        _run_command(
+            ["bcftools", "view", "-Ov", "-o", str(caller_plain_vcf), str(caller_raw_vcf)],
+            "convert GATK VCF to plain text",
+        )
+        shutil.copy2(caller_raw_vcf, standard_raw_vcf)
+    else:
+        log(f"CFTR miner task {task_id}: bcftools mpileup/call in {region}")
+        caller_source = "standard"
+        _call_standard_variants(config, dedup_bam, region, standard_raw_vcf)
+
+    _run_command(["tabix", "-f", "-p", "vcf", str(standard_raw_vcf)], "index raw caller VCF")
     _bcftools_norm_vcf(config.reference_fasta, standard_raw_vcf, standard_norm_vcf)
-    _run_command(["tabix", "-f", "-p", "vcf", str(standard_norm_vcf)], "index normalized standard VCF")
+    _run_command(["tabix", "-f", "-p", "vcf", str(standard_norm_vcf)], "index normalized caller VCF")
 
     clinvar_panel = _load_merged_clinvar_panel(config.clinvar_panel)
     drug_panel = _load_drug_panel(config.drug_panel)
 
     standard_variants: List[VariantRecord] = []
-    for variant in _parse_vcf_records(standard_norm_vcf, "standard"):
+    for variant in _parse_vcf_records(standard_norm_vcf, caller_source):
         if _is_valid_allele(variant.ref) and _is_valid_allele(variant.alt):
             standard_variants.append(variant)
 
-    bcftools_tsv = output_dir / "bcftools_candidates.tsv"
-    _write_bcftools_candidates_tsv(bcftools_tsv, standard_variants)
+    caller_tsv = output_dir / "gatk_candidates.tsv"
+    if not _use_gatk_caller(config):
+        caller_tsv = output_dir / "bcftools_candidates.tsv"
+    _write_bcftools_candidates_tsv(caller_tsv, standard_variants)
 
     log(f"CFTR miner task {task_id}: panel pileup scan")
     panel_entries = _load_panel_variants_in_region(
@@ -196,7 +228,10 @@ def process_cftr_task_for_miner(
         except Exception as exc:
             log(f"CFTR miner task {task_id}: population AF cache skipped: {exc}")
 
-    log(f"CFTR miner task {task_id}: selecting variants (bcftools-first, evidence-based)")
+    log(
+        f"CFTR miner task {task_id}: selecting variants "
+        f"({caller_source}-first, panel + gnomAD GT)"
+    )
     selected_variants, review_rows = _select_variants(
         standard_variants,
         panel_variants,
@@ -207,29 +242,16 @@ def process_cftr_task_for_miner(
     )
     region_chrom = _region_chrom(region) or "chr7"
     contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
-    truth_vcf_path = task_dir / "truth.vcf"
-    if truth_vcf_path.exists():
-        selected_variants = _calibrate_selected_to_task_truth(
-            selected_variants,
-            truth_vcf_path,
-            clinvar_panel,
-            config.reference_fasta,
-        )
-        log(
-            f"CFTR miner task {task_id}: calibrated submission to task truth "
-            f"({len(selected_variants)} variants)"
-        )
-    else:
-        selected_variants = _harmonize_selected_variants_norm(
-            selected_variants,
-            config,
-            work_dir,
-            region_chrom,
-            contig_length,
-            log,
-            clinvar_panel=clinvar_panel,
-            pop_lookup=pop_lookup,
-        )
+    selected_variants = _harmonize_selected_variants_norm(
+        selected_variants,
+        config,
+        work_dir,
+        region_chrom,
+        contig_length,
+        log,
+        clinvar_panel=clinvar_panel,
+        pop_lookup=pop_lookup,
+    )
     final_review_path = output_dir / "final_review.tsv"
     _write_final_review_tsv(final_review_path, review_rows)
 
@@ -254,12 +276,10 @@ def process_cftr_task_for_miner(
     vcf_path = output_dir / "submission.vcf"
     vcf_path.write_text(vcf_content, encoding="utf-8")
 
-    truth_ann_path = task_dir / "cftr2_annotations.json"
     cftr_annotations = _build_cftr_annotations(
         selected_variants,
         clinvar_panel,
         drug_panel,
-        truth_ann_path if truth_ann_path.exists() else None,
     )
     annotation_path = output_dir / "annotation.json"
     annotation_path.write_text(
@@ -278,6 +298,7 @@ def process_cftr_task_for_miner(
         "cftr_annotations": cftr_annotations,
         "elapsed_time": elapsed_time,
         "counts": {
+            "gatk_candidates": len(standard_variants),
             "bcftools_candidates": len(standard_variants),
             "panel_pileup_candidates": len(panel_variants),
             "panel_read_backed": sum(1 for variant in panel_variants if variant.read_backed),
@@ -289,9 +310,11 @@ def process_cftr_task_for_miner(
             "read1_fastq": str(read1_path),
             "read2_fastq": str(read2_path),
             "aligned_bam": str(bam_path),
+            "dedup_bam": str(dedup_bam),
+            "caller_plain_vcf": str(caller_plain_vcf) if caller_plain_vcf.exists() else "",
             "standard_raw_vcf": str(standard_raw_vcf),
             "standard_norm_vcf": str(standard_norm_vcf),
-            "bcftools_candidates_tsv": str(bcftools_tsv),
+            "caller_candidates_tsv": str(caller_tsv),
             "panel_pileup_candidates_tsv": str(panel_tsv),
             "final_review_tsv": str(final_review_path),
             "submission_vcf": str(vcf_path),
@@ -307,6 +330,8 @@ class CftrMinerConfig:
     reference_header: str
     clinvar_panel: Path
     drug_panel: Path
+    gatk_path: Path
+    caller: str
     threads: int
     min_baseq: int
     min_mapq: int
@@ -492,22 +517,70 @@ def _promote_genotype_from_evidence(
     return inferred
 
 
+def _gt_from_gnomad(variant: VariantRecord) -> Optional[str]:
+    """Infer diploid GT from gnomAD population AF (AF_ESP) and sample allele fraction."""
+    pop_af = variant.af_esp
+    if pop_af is None:
+        return None
+    af = variant.af
+    if variant.alt_depth < 1:
+        return None
+    if pop_af >= 0.90:
+        return "1/1" if af >= 0.35 else None
+    if pop_af >= 0.25:
+        if af >= 0.72:
+            return "1/1"
+        if af >= 0.15:
+            return "0/1"
+    if pop_af < 0.01:
+        if af >= 0.82:
+            return "1/1"
+        if af >= 0.10:
+            return "0/1"
+    if 0.20 <= af <= 0.80:
+        return "0/1"
+    return None
+
+
 def _finalize_genotype(
     variant: VariantRecord,
     clinical_significance: str = "",
     pop_lookup: Optional[PopulationAfLookup] = None,
 ) -> str:
-    """Finalize GT using bcftools, read depth/AF, and optional gnomAD population AF."""
+    """Finalize GT using caller GT, read depth/AF, and gnomAD population AF."""
     _attach_population_af(variant, pop_lookup)
-    bcftools_gt = None
-    if "standard" in variant.source:
-        bcftools_gt = _normalize_submission_gt(variant.gt)
-    return _promote_genotype_from_evidence(variant, bcftools_gt, clinical_significance)
+    caller_gt = None
+    if _is_primary_caller_source(variant.source):
+        caller_gt = _normalize_submission_gt(variant.gt)
+    evidence_gt = _promote_genotype_from_evidence(
+        variant, caller_gt, clinical_significance
+    )
+    gnomad_gt = _gt_from_gnomad(variant)
+    if gnomad_gt is None or not _is_primary_caller_source(variant.source):
+        return evidence_gt
+    if variant.alt_depth < 2:
+        return evidence_gt
+    if gnomad_gt == evidence_gt:
+        return gnomad_gt
+    if gnomad_gt == "1/1" and variant.af >= 0.38:
+        return "1/1"
+    if gnomad_gt == "0/1" and 0.10 <= variant.af <= 0.90:
+        return "0/1"
+    return evidence_gt
+
+
+def _is_primary_caller_source(source: str) -> bool:
+    """True for GATK HaplotypeCaller or legacy bcftools mpileup/call variants."""
+    return "gatk" in source or "standard" in source
+
+
+def _use_gatk_caller(config: CftrMinerConfig) -> bool:
+    return config.caller.strip().lower() != "bcftools"
 
 
 def _nonpanel_standard_drop_reason(variant: VariantRecord) -> Optional[str]:
-    """Drop high-confidence false-positive bcftools-only calls (not in ClinVar panel)."""
-    if variant.is_panel or "standard" not in variant.source:
+    """Drop high-confidence false-positive caller-only calls (not in ClinVar panel)."""
+    if variant.is_panel or not _is_primary_caller_source(variant.source):
         return None
     qual = variant.qual if variant.qual is not None else 0.0
     af = variant.af
@@ -544,7 +617,7 @@ def _merged_genotype(existing: VariantRecord, incoming: VariantRecord) -> str:
     """When merging panel pileup with bcftools, prefer the stronger genotype call."""
     candidates: List[str] = []
     for record in (existing, incoming):
-        if "standard" in record.source:
+        if _is_primary_caller_source(record.source):
             gt = _normalize_submission_gt(record.gt)
             if gt and gt not in ("0/0", "./."):
                 candidates.append(gt)
@@ -695,6 +768,8 @@ def _config_from_env(base_dir: Path) -> CftrMinerConfig:
             "NIOME_CFTR_DRUG_PANEL",
             "panel/cftr_drug_response_by_id.csv",
         ),
+        gatk_path=_resolve_gatk_executable(base_dir),
+        caller=os.environ.get("NIOME_CALLER", "gatk").strip().lower(),
         threads=max(1, _env_int("NIOME_THREADS", 8)),
         min_baseq=_env_int("NIOME_MIN_BASEQ", 13),
         min_mapq=_env_int("NIOME_MIN_MAPQ", 10),
@@ -942,6 +1017,158 @@ def _run_command(command: List[str], description: str) -> None:
         stdout = exc.stdout.strip() if exc.stdout else ""
         details = stderr or stdout or f"exit code {exc.returncode}"
         raise RuntimeError(f"Failed to {description}: {details}") from exc
+
+
+def _resolve_gatk_executable(base_dir: Path) -> Path:
+    env_value = os.environ.get("NIOME_GATK", "").strip()
+    candidates: List[Path] = []
+    if env_value:
+        candidates.append(Path(env_value))
+    candidates.extend(
+        [
+            base_dir / "tools" / "gatk" / "gatk",
+            Path("/root/manualtest_55/gatk-4.6.2.0/gatk"),
+        ]
+    )
+    for candidate in candidates:
+        path = candidate if candidate.is_absolute() else base_dir / candidate
+        if path.exists() and os.access(path, os.X_OK):
+            return path.resolve()
+    raise FileNotFoundError(
+        "GATK executable not found. Set NIOME_GATK or install GATK under tools/gatk/gatk."
+    )
+
+
+def _run_gatk(config: CftrMinerConfig, tool_name: str, tool_args: List[str]) -> None:
+    command = [str(config.gatk_path), tool_name, *tool_args]
+    _run_command(command, f"run GATK {tool_name}")
+
+
+def _reference_dict_path(reference_fasta: Path) -> Path:
+    """GATK/Picard expect ref.dict alongside ref.fa (not ref.fa.dict)."""
+    name = reference_fasta.name
+    if name.endswith(".fa"):
+        return reference_fasta.with_name(name[:-3] + ".dict")
+    if name.endswith(".fasta"):
+        return reference_fasta.with_name(name[:-5] + ".dict")
+    if name.endswith(".fna"):
+        return reference_fasta.with_name(name[:-4] + ".dict")
+    return reference_fasta.with_suffix(".dict")
+
+
+def _ensure_reference_indexes(
+    config: CftrMinerConfig,
+    logger: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Build BWA/FAI/DICT indexes required by bwa mem and GATK."""
+    log = logger or (lambda _msg: None)
+    reference = config.reference_fasta
+    fai_path = Path(f"{reference}.fai")
+    if not fai_path.exists():
+        log(f"Indexing reference FASTA: {reference}")
+        _run_command(["samtools", "faidx", str(reference)], "index reference FASTA")
+
+    bwa_suffixes = (".amb", ".ann", ".bwt", ".pac", ".sa")
+    if not all(Path(f"{reference}{suffix}").exists() for suffix in bwa_suffixes):
+        log(f"Building BWA index: {reference}")
+        _run_command(["bwa", "index", str(reference)], "build BWA index")
+
+    dict_path = _reference_dict_path(reference)
+    if not dict_path.exists():
+        log(f"Creating sequence dictionary: {dict_path}")
+        _run_gatk(
+            config,
+            "CreateSequenceDictionary",
+            ["-R", str(reference), "-O", str(dict_path)],
+        )
+
+
+def _prepare_dedup_bam_from_reads(
+    config: CftrMinerConfig,
+    read1_path: Path,
+    read2_path: Path,
+    work_dir: Path,
+    sample_name: str,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Path:
+    """bwa mem -> sort -> AddOrReplaceReadGroups -> MarkDuplicates (GATK preprocessing)."""
+    log = logger or (lambda _msg: None)
+    sorted_bam = work_dir / "sorted.bam"
+    rg_bam = work_dir / "rg.bam"
+    dedup_bam = work_dir / "dedup.bam"
+
+    if dedup_bam.exists() and Path(f"{dedup_bam}.bai").exists():
+        return dedup_bam
+
+    if not sorted_bam.exists() or not Path(f"{sorted_bam}.bai").exists():
+        log("Running bwa mem | samtools sort")
+        _align_reads(config, read1_path, read2_path, sorted_bam)
+        _run_command(["samtools", "index", str(sorted_bam)], "index sorted BAM")
+
+    if not rg_bam.exists() or not Path(f"{rg_bam}.bai").exists():
+        log("Running GATK AddOrReplaceReadGroups")
+        _run_gatk(
+            config,
+            "AddOrReplaceReadGroups",
+            [
+                "-I",
+                str(sorted_bam),
+                "-O",
+                str(rg_bam),
+                "-RGID",
+                "1",
+                "-RGLB",
+                "lib1",
+                "-RGPL",
+                "ILLUMINA",
+                "-RGPU",
+                "unit1",
+                "-RGSM",
+                sample_name,
+            ],
+        )
+        _run_command(["samtools", "index", str(rg_bam)], "index RG BAM")
+
+    if not dedup_bam.exists() or not Path(f"{dedup_bam}.bai").exists():
+        metrics_path = work_dir / "markdup_metrics.txt"
+        log("Running GATK MarkDuplicates")
+        _run_gatk(
+            config,
+            "MarkDuplicates",
+            [
+                "-I",
+                str(rg_bam),
+                "-O",
+                str(dedup_bam),
+                "-M",
+                str(metrics_path),
+            ],
+        )
+        _run_command(["samtools", "index", str(dedup_bam)], "index deduplicated BAM")
+
+    return dedup_bam
+
+
+def _call_gatk_haplotypecaller(
+    config: CftrMinerConfig,
+    bam_path: Path,
+    region: str,
+    output_vcf: Path,
+) -> None:
+    args = [
+        "-R",
+        str(config.reference_fasta),
+        "-I",
+        str(bam_path),
+        "-L",
+        region,
+        "-O",
+        str(output_vcf),
+    ]
+    hmm_threads = min(config.threads, 8)
+    if hmm_threads > 1:
+        args.extend(["--native-pair-hmm-threads", str(hmm_threads)])
+    _run_gatk(config, "HaplotypeCaller", args)
 
 
 def _align_reads(config: CftrMinerConfig, read1_path: Path, read2_path: Path, bam_path: Path) -> None:
@@ -1898,81 +2125,6 @@ def _mpileup_hot_positions(
     return hot_positions
 
 
-def _parse_plain_truth_vcf(truth_path: Path) -> List[VariantRecord]:
-    """Load variants from a local truth VCF (no gzip)."""
-    records: List[VariantRecord] = []
-    with truth_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip() or line.startswith("#"):
-                continue
-            fields = line.rstrip("\n").split("\t")
-            if len(fields) < 10:
-                continue
-            chrom, pos_raw, _id, ref, alt, _qual, _filt, _info, _fmt, sample = fields[:10]
-            gt = "0/1"
-            fmt_fields = _fmt.split(":")
-            sample_fields = sample.split(":")
-            if fmt_fields and sample_fields:
-                fmt_map = dict(zip(fmt_fields, sample_fields))
-                parsed_gt = _gt_from_vcf_format(fmt_map)
-                if parsed_gt:
-                    gt = parsed_gt
-            try:
-                position = int(pos_raw)
-            except ValueError:
-                continue
-            records.append(
-                VariantRecord(
-                    chrom=_vcf_chrom(chrom),
-                    pos=position,
-                    ref=ref,
-                    alt=alt,
-                    gt=gt,
-                    source="truth_calibration",
-                    read_backed=True,
-                )
-            )
-    return records
-
-
-def _calibrate_selected_to_task_truth(
-    selected: List[VariantRecord],
-    truth_path: Path,
-    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
-    reference_fasta: Path,
-) -> List[VariantRecord]:
-    """Align miner submission to bundled task truth for local validation (tasks/*/truth.vcf)."""
-    truth_records = _parse_plain_truth_vcf(truth_path)
-    truth_keys = {_variant_key(record) for record in truth_records}
-    calibrated: Dict[Tuple[str, int, str, str], VariantRecord] = {}
-
-    for variant in selected:
-        key = _variant_key(variant)
-        if key in truth_keys:
-            calibrated[key] = variant
-
-    validated_truth = _validate_submission_variants(truth_records, reference_fasta)
-
-    for truth_variant in validated_truth:
-        key = _variant_key(truth_variant)
-        panel_entry = clinvar_panel.get(key, {})
-        if key in calibrated:
-            calibrated[key].gt = truth_variant.gt
-            if panel_entry and not calibrated[key].variation_id:
-                calibrated[key].variation_id = panel_entry.get("variation_id", "")
-                calibrated[key].is_panel = True
-        else:
-            truth_variant.is_panel = bool(panel_entry)
-            if panel_entry:
-                truth_variant.variation_id = panel_entry.get("variation_id", "")
-            calibrated[key] = truth_variant
-
-    return sorted(
-        calibrated.values(),
-        key=lambda item: (_chrom_sort_key(item.chrom), item.pos, item.ref, item.alt),
-    )
-
-
 def _select_variants(
     standard_variants: List[VariantRecord],
     panel_variants: List[VariantRecord],
@@ -2053,7 +2205,7 @@ def _rescue_panel_standard_candidates(
     for key, variant in candidates.items():
         if key in selected_map:
             continue
-        if "standard" not in variant.source:
+        if not _is_primary_caller_source(variant.source):
             continue
         panel_entry = clinvar_panel.get(key, {})
         if not panel_entry:
@@ -2075,7 +2227,7 @@ def _rescue_panel_standard_candidates(
             variant.gt = "0/1"
         selected_map[key] = variant
         review_rows.append(
-            _review_row(variant, True, f"rescue_panel_standard_{reason}", panel_entry)
+            _review_row(variant, True, f"rescue_panel_caller_{reason}", panel_entry)
         )
 
 
@@ -2106,7 +2258,7 @@ def _rescue_pathogenic_panel_candidates(
         if variant.alt_depth < 1 or not variant.read_backed:
             continue
         is_indel = len(variant.ref) != 1 or len(variant.alt) != 1
-        if is_indel and variant.af >= 0.90 and "standard" not in variant.source:
+        if is_indel and variant.af >= 0.90 and not _is_primary_caller_source(variant.source):
             continue
         keep, reason = _keep_decision(variant, True, config, clin_sig)
         if not keep:
@@ -2133,7 +2285,7 @@ def _drop_nonpanel_long_indel_fps(
         if variant.is_panel or key in clinvar_panel:
             kept.append(variant)
             continue
-        if "standard" not in variant.source:
+        if not _is_primary_caller_source(variant.source):
             kept.append(variant)
             continue
         is_indel = len(variant.ref) != 1 or len(variant.alt) != 1
@@ -2155,7 +2307,9 @@ def _prune_redundant_neighbors(
 
     def support_rank(item: VariantRecord) -> Tuple[int, int, int]:
         source_rank = {
+            "gatk": 3,
             "standard": 3,
+            "panel+gatk": 3,
             "panel+standard": 3,
             "panel_pileup": 2,
             "mpileup_discovery": 1,
@@ -2190,7 +2344,11 @@ def _prune_redundant_neighbors(
 
 def _allele_support_rank(variant: VariantRecord) -> Tuple[int, int, int, float]:
     """Higher is stronger evidence (bcftools standard preferred over pileup-only)."""
-    source_rank = 3 if "standard" in variant.source else (2 if variant.source == "panel_pileup" else 1)
+    source_rank = (
+        3
+        if _is_primary_caller_source(variant.source)
+        else (2 if variant.source == "panel_pileup" else 1)
+    )
     qual = variant.qual if variant.qual is not None else 0.0
     return (source_rank, variant.alt_depth, variant.dp, qual)
 
@@ -2207,7 +2365,11 @@ def _prune_conflicting_alleles_at_position(
         by_pos.setdefault(pos_key, []).append(variant)
 
     def _position_conflict_rank(item: VariantRecord) -> Tuple[int, int, int, int, int]:
-        source_rank = 3 if "standard" in item.source else (2 if item.is_panel else 1)
+        source_rank = (
+            3
+            if _is_primary_caller_source(item.source)
+            else (2 if item.is_panel else 1)
+        )
         het_pref = 1 if (item.gt or "") == "0/1" and item.af < 0.60 else 0
         return (source_rank, het_pref, item.alt_depth, int(item.af * 1000), item.dp)
 
@@ -2232,7 +2394,7 @@ def _panel_has_strong_support(
 ) -> bool:
     sig = clinical_significance.lower().replace("_", " ")
     is_indel = len(variant.ref) != 1 or len(variant.alt) != 1
-    if "standard" in variant.source:
+    if _is_primary_caller_source(variant.source):
         return variant.alt_depth >= 1
     if variant.source == "panel_pileup":
         if "pathogenic" in sig or "uncertain" in sig or "likely pathogenic" in sig:
@@ -2288,7 +2450,7 @@ def _keep_decision(
         return False, "drop_low_qual"
 
     min_af = config.min_af
-    if "standard" in variant.source:
+    if _is_primary_caller_source(variant.source):
         min_af = min(config.min_af, 0.08)
     if is_panel and (len(variant.ref) != 1 or len(variant.alt) != 1):
         min_af = min(config.min_af, 0.05)
@@ -2340,7 +2502,7 @@ def _keep_decision(
     if (
         is_panel
         and _is_likely_benign_only(clinical_significance)
-        and variant.source != "standard"
+        and not _is_primary_caller_source(variant.source)
     ):
         return False, "drop_panel_likely_benign"
 
@@ -2372,6 +2534,23 @@ def _keep_decision(
     return False, "drop_weak_nonpanel"
 
 
+def _merge_variant_sources(existing_source: str, incoming_source: str) -> str:
+    if existing_source == incoming_source:
+        return existing_source
+    caller_tag = (
+        "gatk"
+        if "gatk" in (existing_source, incoming_source)
+        else "standard"
+    )
+    has_panel = "panel" in existing_source or "panel" in incoming_source
+    has_caller = _is_primary_caller_source(
+        existing_source
+    ) or _is_primary_caller_source(incoming_source)
+    if has_panel and has_caller:
+        return f"panel+{caller_tag}"
+    return incoming_source if incoming_source else existing_source
+
+
 def _merge_variant_records(
     existing: Optional[VariantRecord],
     incoming: VariantRecord,
@@ -2387,7 +2566,7 @@ def _merge_variant_records(
         pos=primary.pos,
         ref=primary.ref,
         alt=primary.alt,
-        qual=secondary.qual if secondary.source == "standard" else primary.qual,
+        qual=secondary.qual if _is_primary_caller_source(secondary.source) else primary.qual,
         filter_value="PASS",
         gt=merged_gt,
         dp=primary.dp,
@@ -2397,16 +2576,12 @@ def _merge_variant_records(
         ad=primary.ad or secondary.ad,
         adf=primary.adf or secondary.adf,
         adr=primary.adr or secondary.adr,
-        source=(
-            "panel+standard"
-            if existing.source != incoming.source
-            else primary.source
-        ),
+        source=_merge_variant_sources(existing.source, incoming.source),
         variation_id=primary.variation_id or secondary.variation_id,
         is_panel=primary.is_panel or secondary.is_panel,
         read_backed=_is_read_backed(primary.ref_depth, primary.alt_depth, primary.dp),
     )
-    if secondary.source == "standard" and secondary.qual is not None:
+    if _is_primary_caller_source(secondary.source) and secondary.qual is not None:
         merged.qual = secondary.qual
         merged.ad = secondary.ad or merged.ad
         merged.adf = secondary.adf or merged.adf
@@ -2637,7 +2812,6 @@ def _build_cftr_annotations(
     variants: List[VariantRecord],
     clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
     drug_panel: Dict[str, Dict[str, str]],
-    truth_annotations_path: Optional[Path] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """Build CFTR2 annotations for submitted panel variants only (no extra RSIDs)."""
     built = _build_annotations(variants, clinvar_panel, drug_panel)
@@ -2654,25 +2828,7 @@ def _build_cftr_annotations(
             continue
         if variation_id in built:
             submitted[variation_id] = built[variation_id]
-    if truth_annotations_path is None or not truth_annotations_path.exists():
-        return submitted
-    try:
-        truth_ann = json.loads(truth_annotations_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return submitted
-    merged: Dict[str, Dict[str, Any]] = {}
-    for variant in variants:
-        entry = _panel_entry_exact(variant, clinvar_panel)
-        if not entry:
-            continue
-        variation_id = str(entry["variation_id"])
-        if variation_id.startswith("supp_"):
-            continue
-        if variation_id in truth_ann:
-            merged[variation_id] = truth_ann[variation_id]
-        elif variation_id in submitted:
-            merged[variation_id] = submitted[variation_id]
-    return merged
+    return submitted
 
 
 def _harmonize_selected_variants_norm(

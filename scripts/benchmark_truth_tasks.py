@@ -14,17 +14,16 @@ from niome_subnet.cftr_miner_logic import (  # noqa: E402
     DEFAULT_REGION,
     _align_reads,
     _bcftools_norm_vcf,
-    _build_annotations,
-    _calibrate_selected_to_task_truth,
+    _build_cftr_annotations,
     _call_standard_variants,
     _config_from_env,
     _discover_homozygous_evidence_variants,
     _ensure_executable,
+    _harmonize_selected_variants_norm,
     _load_clinvar_panel,
     _load_drug_panel,
     _load_panel_variants_in_region,
     _panel_pileup_scan,
-    _parse_plain_truth_vcf,
     _parse_vcf_records,
     _prepare_submission_vcf,
     _reference_contig_length,
@@ -140,24 +139,23 @@ def run_task(task_id: str) -> dict:
         standard_variants, panel_variants, discovered, clinvar_panel, config
     )
     truth_vcf = task_dir / "truth.vcf"
-    calibrated = False
-    if truth_vcf.exists():
-        selected = _calibrate_selected_to_task_truth(
-            selected, truth_vcf, clinvar_panel, config.reference_fasta
-        )
-        calibrated = True
-
     region_chrom = _region_chrom(region) or "chr7"
     contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
+    selected = _harmonize_selected_variants_norm(
+        selected,
+        config,
+        work_dir,
+        region_chrom,
+        contig_length,
+        lambda _m: None,
+        clinvar_panel=clinvar_panel,
+    )
     vcf_content = _prepare_submission_vcf(
         selected, config, work_dir, region_chrom, contig_length, lambda _m: None
     )
 
     truth_ann = task_dir / "cftr2_annotations.json"
-    if truth_ann.exists():
-        annotations = json.loads(truth_ann.read_text(encoding="utf-8"))
-    else:
-        annotations = _build_annotations(selected, clinvar_panel, drug_panel)
+    annotations = _build_cftr_annotations(selected, clinvar_panel, drug_panel)
 
     ref_fasta = str(config.reference_fasta)
     vcf_metrics = _score_vcf_against_truth(
@@ -171,7 +169,6 @@ def run_task(task_id: str) -> dict:
 
     result = {
         "task_id": task_id,
-        "calibrated": calibrated,
         "variant_count": len(selected),
         "annotation_score": ann_score,
         "final_score": final_score,
@@ -206,7 +203,7 @@ def main() -> None:
             f"\n{task_id}: final={result['final_score']:.4f} "
             f"vcf={result['vcf_score']:.4f} ann={result['annotation_score']:.4f} "
             f"tp_w={result['tp_w']:.2f} fp_w={result['fp_w']:.2f} fn_w={result['fn_w']:.2f} "
-            f"variants={result['variant_count']} calibrated={result['calibrated']}"
+            f"variants={result['variant_count']}"
         )
 
 
