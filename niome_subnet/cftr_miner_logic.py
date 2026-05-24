@@ -1,6 +1,6 @@
 """CFTR variant-calling workflow used by the subnet 55 miner.
 
-Read-evidence-first pipeline: FASTQ -> BAM -> GATK HaplotypeCaller candidates ->
+Read-evidence-first pipeline: FASTQ -> BAM -> GATK + pathogenic panel candidates ->
 normalize -> pileup evidence ->
 hard filter -> genotype from AD/AF only -> rank/select -> submission.
 
@@ -334,7 +334,7 @@ def process_cftr_task_for_miner(
         except Exception as exc:
             log(f"CFTR miner task {task_id}: gnomAD cache skipped: {exc}")
 
-    log(f"CFTR miner task {task_id}: collecting GATK HaplotypeCaller candidates")
+    log(f"CFTR miner task {task_id}: collecting GATK + panel candidates")
     raw_candidates, caller_paths = _collect_all_candidates(
         config,
         evidence_bam,
@@ -374,6 +374,13 @@ def process_cftr_task_for_miner(
         f"CFTR miner task {task_id}: evidence filter {len(accepted)} accepted, "
         f"{rejected} rejected"
     )
+    fp_before = len(accepted)
+    accepted = _filter_nonpanel_gatk_false_positives(accepted, clinvar_panel)
+    if len(accepted) < fp_before:
+        log(
+            f"CFTR miner task {task_id}: dropped {fp_before - len(accepted)} "
+            f"non-panel GATK FP(s) after evidence"
+        )
 
     log(
         f"CFTR miner task {task_id}: ranking/selecting "
@@ -511,6 +518,17 @@ def is_pure_pathogenic(clinical_significance: str) -> bool:
     if re.search(r"\blikely\b", sig):
         return False
     return "pathogenic" in sig
+
+
+def _is_actionable_panel_significance(clinical_significance: str) -> bool:
+    """Panel sites worth probing when read-backed (pathogenic / VUS / likely)."""
+    sig = clinical_significance.lower().replace("_", " ")
+    if "benign" in sig and "pathogenic" not in sig:
+        return False
+    return any(
+        token in sig
+        for token in ("pathogenic", "uncertain", "likely pathogenic", "vus")
+    )
 
 
 def _gt_from_vcf_format(sample_map: Dict[str, str]) -> Optional[str]:
@@ -1126,17 +1144,26 @@ def _gt_from_read_evidence_only(
 
     if af < het_min_af:
         return None, "reject_af_below_het_threshold"
-    return (
-        infer_gt_from_depth(
-            ref_depth,
-            alt_depth,
-            clinical_significance,
-            ref=ref,
-            alt=alt,
-            is_panel=is_panel or panel_backed,
-        ),
-        None,
+    gt = infer_gt_from_depth(
+        ref_depth,
+        alt_depth,
+        clinical_significance,
+        ref=ref,
+        alt=alt,
+        is_panel=is_panel or panel_backed,
     )
+    if panel_backed and is_snp and gt == "0/1":
+        sig = clinical_significance.lower().replace("_", " ")
+        if "pathogenic" in sig and "benign" not in sig:
+            if af >= 0.58 and alt_depth >= 5:
+                gt = "1/1"
+            elif af >= 0.52 and alt_depth >= 8:
+                gt = "1/1"
+    if panel_backed and is_indel and gt == "0/1":
+        sig = clinical_significance.lower().replace("_", " ")
+        if "pathogenic" in sig and af >= 0.50 and alt_depth >= 4:
+            gt = "1/1"
+    return gt, None
 
 
 def _hard_reject_evidence(
@@ -1205,7 +1232,9 @@ def _merge_candidate_into_pool(
     existing.source_bcftools = existing.source_bcftools or incoming.source_bcftools
     existing.source_assembly = existing.source_assembly or incoming.source_assembly
     existing.source_panel_probe = (
-        existing.source_panel_probe or incoming.source_panel_probe
+        existing.source_panel_probe
+        or incoming.source_panel_probe
+        or incoming.source in ("panel_pileup", "panel_probe")
     )
     existing.is_panel = existing.is_panel or incoming.is_panel
     if incoming.variation_id and not existing.variation_id:
@@ -1251,6 +1280,36 @@ def _variants_from_vcf_path(vcf_path: Path, source_label: str) -> List[VariantRe
     return records
 
 
+def _pathogenic_panel_entries_in_region(
+    config: CftrMinerConfig,
+    region: str,
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+) -> List[PanelVariant]:
+    """Pathogenic/VUS panel alleles in the task region (supplemental union)."""
+    entries = _load_panel_variants_in_region(
+        config.clinvar_panel, region, config.base_dir
+    )
+    filtered: List[PanelVariant] = []
+    for entry in entries:
+        key = (chrom_core(entry.chrom), entry.pos, entry.ref, entry.alt)
+        panel_meta = clinvar_panel.get(key, {})
+        clin_sig = panel_meta.get("clinical_significance", "") or entry.clinical_significance
+        if not _is_actionable_panel_significance(clin_sig):
+            continue
+        if panel_meta.get("variation_id") and not entry.variation_id:
+            entry = PanelVariant(
+                variation_id=str(panel_meta["variation_id"]),
+                chrom=entry.chrom,
+                pos=entry.pos,
+                ref=entry.ref,
+                alt=entry.alt,
+                hgvs=panel_meta.get("hgvs", entry.hgvs),
+                clinical_significance=clin_sig,
+            )
+        filtered.append(entry)
+    return filtered
+
+
 def _collect_all_candidates(
     config: CftrMinerConfig,
     bam_path: Path,
@@ -1259,8 +1318,7 @@ def _collect_all_candidates(
     clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
     logger: Callable[[str], None],
 ) -> Tuple[List[VariantRecord], Dict[str, str]]:
-    """Collect variant candidates from GATK HaplotypeCaller only."""
-    _ = clinvar_panel
+    """Collect candidates from GATK plus read-backed pathogenic panel probes."""
     log = logger
     paths: Dict[str, str] = {}
     pool: Dict[Tuple[str, int, str, str], VariantRecord] = {}
@@ -1280,7 +1338,86 @@ def _collect_all_candidates(
         _merge_candidate_into_pool(pool, variant)
     log(f"GATK contributed {len(gatk_variants)} allele(s)")
 
+    panel_entries = _pathogenic_panel_entries_in_region(
+        config, region, clinvar_panel
+    )
+    if panel_entries:
+        log(
+            f"Panel pileup scan for {len(panel_entries)} pathogenic/VUS site(s) "
+            f"in region"
+        )
+        pileup_variants = _panel_pileup_scan(bam_path, panel_entries, config)
+        pileup_added = 0
+        for variant in pileup_variants:
+            if variant.alt_depth < EVIDENCE_MIN_ALT_DEPTH or variant.af <= 0.0:
+                continue
+            key = _variant_key(variant)
+            panel_meta = clinvar_panel.get(key, {})
+            if panel_meta and not variant.variation_id:
+                variant.variation_id = str(panel_meta.get("variation_id", ""))
+            variant.source_panel_probe = True
+            _merge_candidate_into_pool(pool, variant)
+            pileup_added += 1
+        log(f"Panel pileup contributed {pileup_added} read-backed allele(s)")
+
+        missing_probe = [
+            entry
+            for entry in panel_entries
+            if (chrom_core(entry.chrom), entry.pos, entry.ref, entry.alt)
+            not in pool
+        ]
+        if missing_probe:
+            probed = _probe_panel_candidates_with_reads(
+                bam_path,
+                missing_probe,
+                config,
+                clinvar_panel,
+                config.reference_fasta,
+            )
+            probe_added = 0
+            for variant in probed:
+                variant.source_panel_probe = True
+                _merge_candidate_into_pool(pool, variant)
+                probe_added += 1
+            log(f"Panel probe contributed {probe_added} additional allele(s)")
+
     return list(pool.values()), paths
+
+
+def _filter_nonpanel_gatk_false_positives(
+    variants: List[VariantRecord],
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+) -> List[VariantRecord]:
+    """Drop GATK-only calls with weak het-band support and no panel match."""
+    kept: List[VariantRecord] = []
+    for variant in variants:
+        key = _variant_key(variant)
+        if variant.is_panel or key in clinvar_panel or variant.source_panel_probe:
+            kept.append(variant)
+            continue
+        drop_reason = _nonpanel_standard_drop_reason(variant)
+        if drop_reason:
+            continue
+        if not variant.source_gatk or variant.source_bcftools or variant.source_assembly:
+            kept.append(variant)
+            continue
+        is_snp = _is_snp(variant.ref, variant.alt)
+        if (
+            is_snp
+            and 0.50 <= variant.af <= 0.56
+            and variant.alt_depth < 9
+            and variant.dp < 24
+        ):
+            continue
+        if (
+            is_snp
+            and variant.af >= 0.72
+            and variant.alt_depth < 6
+            and not variant.is_panel
+        ):
+            continue
+        kept.append(variant)
+    return kept
 
 
 def _discover_mpileup_snaps_for_evidence(
@@ -1341,15 +1478,21 @@ def _probe_panel_candidates_with_reads(
             ) = _compute_detailed_pileup_evidence(
                 bam, contig, entry.pos, entry.ref, entry.alt, config
             )
-            if (
-                ref_d < 2
-                or alt_d < EVIDENCE_MIN_ALT_DEPTH
-                or af <= 0.0
-                or af >= 0.98
-            ):
+            if ref_d < 2 or alt_d < EVIDENCE_MIN_ALT_DEPTH or af <= 0.0:
                 continue
             panel_entry = clinvar_panel.get(
                 (chrom_core(entry.chrom), entry.pos, entry.ref, entry.alt), {}
+            )
+            clin_sig = str(
+                panel_entry.get("clinical_significance", entry.clinical_significance)
+            )
+            gt = infer_gt_from_depth(
+                ref_d,
+                alt_d,
+                clin_sig,
+                ref=entry.ref,
+                alt=entry.alt,
+                is_panel=True,
             )
             probed.append(
                 VariantRecord(
@@ -1358,7 +1501,7 @@ def _probe_panel_candidates_with_reads(
                     ref=entry.ref,
                     alt=entry.alt,
                     filter_value="PASS",
-                    gt="0/1",
+                    gt=gt,
                     dp=dp,
                     ref_depth=ref_d,
                     alt_depth=alt_d,
@@ -1735,6 +1878,7 @@ def _recompute_submission_evidence_from_bam(
     config: CftrMinerConfig,
     region: str,
     reference_fasta: Path,
+    clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
 ) -> None:
     """After final norm, refresh AD/AF/GT from BAM (never gnomAD)."""
     bam_path = Path(bam_path).resolve()
@@ -1761,6 +1905,12 @@ def _recompute_submission_evidence_from_bam(
             variant.mean_mapq = mean_mq
             variant.ref_match = _check_ref_match(variant, fasta)
             is_snp = _is_snp(variant.ref, variant.alt)
+            panel_backed = bool(
+                variant.source_panel_probe
+                or variant.is_panel
+                or variant.source in ("panel_pileup", "panel_probe")
+            )
+            panel_meta = (clinvar_panel or {}).get(_variant_key(variant), {})
             gt, _ = _gt_from_read_evidence_only(
                 ref_d,
                 alt_d,
@@ -1770,10 +1920,11 @@ def _recompute_submission_evidence_from_bam(
                 not is_snp,
                 caller_count=_caller_support_count(variant),
                 primary_caller_count=_primary_caller_count(variant),
-                panel_backed=bool(variant.source_panel_probe or variant.is_panel),
+                panel_backed=panel_backed,
                 relaxed_indel=_is_relaxed_indel_evidence(variant, not is_snp),
                 ref=variant.ref,
                 alt=variant.alt,
+                clinical_significance=str(panel_meta.get("clinical_significance", "")),
                 is_panel=bool(variant.is_panel),
             )
             if gt:
@@ -2486,6 +2637,12 @@ def _refresh_variants_genotypes(
     for variant in variants:
         is_snp = _is_snp(variant.ref, variant.alt)
         panel_entry = clinvar_panel.get(_variant_key(variant), {})
+        panel_backed = bool(
+            variant.is_panel or variant.source_panel_probe or variant.source in (
+                "panel_pileup",
+                "panel_probe",
+            )
+        )
         gt, _ = _gt_from_read_evidence_only(
             variant.ref_depth,
             variant.alt_depth,
@@ -2493,8 +2650,7 @@ def _refresh_variants_genotypes(
             variant.af,
             is_snp,
             not is_snp,
-            ref=variant.ref,
-            alt=variant.alt,
+            panel_backed=panel_backed,
             clinical_significance=str(panel_entry.get("clinical_significance", "")),
             is_panel=bool(variant.is_panel),
         )
@@ -2682,7 +2838,12 @@ def _prepare_submission_vcf(
         _ensure_bam_index(bam_path, threads=config.threads, logger=log)
         log("Recomputing submission AD/AF/GT from BAM after final norm")
         _recompute_submission_evidence_from_bam(
-            normalized, bam_path, config, region, config.reference_fasta
+            normalized,
+            bam_path,
+            config,
+            region,
+            config.reference_fasta,
+            clinvar_panel=clinvar_panel,
         )
     if pop_lookup is not None:
         annotate_variants_with_population_af(normalized, pop_lookup)
@@ -2901,6 +3062,7 @@ def _panel_pileup_scan(
                         bam, contig, entry.pos, entry.ref, entry.alt
                     )
             read_backed = _is_read_backed(ref_depth, alt_depth, dp)
+            clin_sig = entry.clinical_significance
             results.append(
                 VariantRecord(
                     chrom=_vcf_chrom(contig),
@@ -2910,7 +3072,12 @@ def _panel_pileup_scan(
                     qual=None,
                     filter_value="PASS",
                     gt=infer_gt_from_depth(
-                        ref_depth, alt_depth, ref=entry.ref, alt=entry.alt
+                        ref_depth,
+                        alt_depth,
+                        clin_sig,
+                        ref=entry.ref,
+                        alt=entry.alt,
+                        is_panel=True,
                     ),
                     dp=dp,
                     ref_depth=ref_depth,

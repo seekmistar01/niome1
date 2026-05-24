@@ -1,0 +1,4 @@
+# Per-task download folders (uuid, bench-*, test*, etc.)
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]-*/
+bench-*/
+test*/
