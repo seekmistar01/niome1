@@ -269,10 +269,13 @@ def process_cftr_task_for_miner(
     task_dir = config.base_dir / "tasks" / safe_task_id
     reads_dir = config.base_dir / "reads" / safe_task_id
     work_dir = _task_work_dir(config.base_dir, safe_task_id)
-    output_dir = config.base_dir / "outputs" / safe_task_id
+    output_dir = config.base_dir / "outputs" / safe_task_id / _miner_instance_id()
     for directory in (task_dir, reads_dir, work_dir, output_dir):
         directory.mkdir(parents=True, exist_ok=True)
-    log(f"CFTR miner task {task_id}: work dir {work_dir} (instance={_miner_instance_id()})")
+    log(
+        f"CFTR miner task {task_id}: work dir {work_dir} "
+        f"output dir {output_dir} (instance={_miner_instance_id()})"
+    )
 
     task_json_path = task_dir / "task.json"
     task_json_path.write_text(json.dumps(task_data, indent=2, sort_keys=True), encoding="utf-8")
@@ -398,11 +401,21 @@ def process_cftr_task_for_miner(
         bam_path=evidence_bam,
         region=region,
     )
+    vcf_lines = vcf_content.splitlines()
+    if vcf_lines:
+        vcf_lines.insert(
+            1,
+            f"##niome_task_id={task_id}",
+        )
+        vcf_lines.insert(2, f"##niome_instance={_miner_instance_id()}")
+        vcf_content = "\n".join(vcf_lines) + "\n"
     vcf_path = output_dir / "submission.vcf"
+    synapse_vcf_path = output_dir / "synapse.vcf"
     output_lock = output_dir / ".submission.write.lock"
     with open(output_lock, "w", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         vcf_path.write_text(vcf_content, encoding="utf-8")
+        synapse_vcf_path.write_text(vcf_content, encoding="utf-8")
 
     cftr_annotations = _build_cftr_annotations(
         selected_variants,
@@ -418,9 +431,15 @@ def process_cftr_task_for_miner(
         )
 
     elapsed_time = time.time() - started_at
+    # Synapse must return exactly what was written to disk (not a stale shared buffer).
+    vcf_content = synapse_vcf_path.read_text(encoding="utf-8")
+    variant_lines = [
+        line for line in vcf_content.splitlines() if line and not line.startswith("#")
+    ]
     log(
         f"CFTR miner task {task_id}: submitted {len(selected_variants)} variants "
-        f"with {len(cftr_annotations)} annotations in {elapsed_time:.2f}s"
+        f"({len(variant_lines)} VCF rows) with {len(cftr_annotations)} annotations "
+        f"in {elapsed_time:.2f}s -> {synapse_vcf_path}"
     )
 
     return {
@@ -446,6 +465,7 @@ def process_cftr_task_for_miner(
             **caller_paths,
             "candidate_evidence_tsv": str(evidence_tsv),
             "submission_vcf": str(vcf_path),
+            "synapse_vcf": str(synapse_vcf_path),
             "annotation_json": str(annotation_path),
         },
     }

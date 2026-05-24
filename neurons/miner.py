@@ -72,15 +72,24 @@ class Miner(BaseMinerNeuron):
                 base_dir=PROJECT_ROOT,
                 logger=lambda msg: bt.logging.info(msg),
             )
-            vcf_content = result["vcf_content"]
+            task_id = str(task_data.get("task_id") or "unknown")
+            synapse_path = result.get("paths", {}).get("synapse_vcf")
+            if synapse_path and Path(synapse_path).exists():
+                vcf_content = Path(synapse_path).read_text(encoding="utf-8")
+            else:
+                vcf_content = result["vcf_content"]
+            variant_rows = sum(
+                1 for line in vcf_content.splitlines() if not line.startswith("#")
+            )
             synapse.vcf_content = vcf_content
             synapse.cftr_annotations = result["cftr_annotations"]
             synapse.elapsed_time = result["elapsed_time"]
             synapse.signature = self._generate_signature(vcf_content, 1.0)
 
             bt.logging.info(
-                f"Generated VCF file and cftr_annotations from JSON schema task: {len(vcf_content)} characters, "
-                f"time: {synapse.elapsed_time:.2f}s"
+                f"Synapse task {task_id}: returning {variant_rows} variants from "
+                f"{synapse_path or 'memory'} ({len(vcf_content)} chars) in "
+                f"{synapse.elapsed_time:.2f}s"
             )
             bt.logging.debug(f"VCF content preview: {vcf_content[:200]}...")
 
