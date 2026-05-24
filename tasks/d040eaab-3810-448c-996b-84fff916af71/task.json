@@ -1,13 +1,13 @@
 {
-  "expected_variant_count": 22,
+  "expected_variant_count": 0,
   "genome_context": {
     "chromosome": "chr7",
     "gene": "CFTR",
     "region": "chr7:117480000-117670000"
   },
   "input": {
-    "read1_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/ddc5b57a-7260-4c00-b521-5d6c20d1e7af/reads_1.fq",
-    "read2_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/ddc5b57a-7260-4c00-b521-5d6c20d1e7af/reads_2.fq"
+    "read1_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/d040eaab-3810-448c-996b-84fff916af71/reads_1.fq",
+    "read2_fastq": "file:///root/55miner/niome_1/subnet-niome/reads/d040eaab-3810-448c-996b-84fff916af71/reads_2.fq"
   },
   "output_spec": {
     "format": "vcf",
@@ -23,7 +23,7 @@
       "SAMPLE"
     ]
   },
-  "task_id": "ddc5b57a-7260-4c00-b521-5d6c20d1e7af",
+  "task_id": "d040eaab-3810-448c-996b-84fff916af71",
   "type": "cftr_variant_calling",
   "version": "2.1"
 }

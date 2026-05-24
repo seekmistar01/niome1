@@ -1,13 +1,17 @@
 """CFTR variant-calling workflow used by the subnet 55 miner.
 
-Primary variant discovery uses GATK (bwa mem, MarkDuplicates, HaplotypeCaller)
-on the CFTR region. Genotypes are refined with gnomAD population AF and read
-depth; ClinVar panel membership drives panel rescue and annotation.json output.
+Read-evidence-first pipeline: FASTQ -> BAM -> GATK HaplotypeCaller candidates ->
+normalize -> pileup evidence ->
+hard filter -> genotype from AD/AF only -> rank/select -> submission.
+
+gnomAD is used only for optional INFO (AF_ESP) and tie-breaking during ranking;
+it never creates variants or sets genotypes.
 """
 
 from __future__ import annotations
 
 import csv
+import fcntl
 import gzip
 import json
 import os
@@ -79,6 +83,164 @@ class VariantRecord:
     is_panel: bool = False
     read_backed: bool = False
     af_esp: Optional[float] = None
+    source_gatk: bool = False
+    source_bcftools: bool = False
+    source_assembly: bool = False
+    source_panel_probe: bool = False
+    evidence_score: float = 0.0
+    evidence_status: str = ""
+    evidence_reason: str = ""
+    ref_match: bool = True
+    strand_balanced: bool = False
+    mean_alt_bq: float = 0.0
+    mean_mapq: float = 0.0
+
+
+# Evidence-first hard thresholds (override via env where noted).
+EVIDENCE_MIN_DP = 3
+EVIDENCE_MIN_ALT_DEPTH = 2
+EVIDENCE_MIN_AF = 0.12
+EVIDENCE_SNV_MIN_AF = 0.18
+EVIDENCE_INDEL_MIN_ALT_DEPTH = 3
+EVIDENCE_INDEL_MIN_AF = 0.20
+EVIDENCE_LOW_DP_HET_MAX_DP = 5
+EVIDENCE_LOW_DP_HET_MIN_AF = 0.35
+GT_HOM_AF = 0.80
+GT_HET_MIN_AF = 0.20
+
+
+class BamIndexError(RuntimeError):
+    """Raised when a BAM exists but a usable index cannot be created or found."""
+
+
+def _miner_instance_id() -> str:
+    """Per-process work dir suffix (MINER_INSTANCE env or pid)."""
+    return os.environ.get("MINER_INSTANCE") or str(os.getpid())
+
+
+def _task_work_dir(base_dir: Path, task_id: str) -> Path:
+    return base_dir / "work" / task_id / _miner_instance_id()
+
+
+def _bam_index_candidate_paths(bam_path: Path) -> List[Path]:
+    """Return possible index paths for a BAM (sample.bam.bai and sample.bai)."""
+    bam_path = Path(bam_path).resolve()
+    return [Path(f"{bam_path}.bai"), bam_path.with_suffix(".bai")]
+
+
+def _find_bam_index_path(bam_path: Path) -> Optional[Path]:
+    for index_path in _bam_index_candidate_paths(bam_path):
+        if index_path.exists() and index_path.stat().st_size > 0:
+            return index_path.resolve()
+    return None
+
+
+def _has_valid_bam_index(bam_path: Path) -> bool:
+    return _find_bam_index_path(bam_path) is not None
+
+
+def _ensure_bam_index(
+    bam_path: Path,
+    threads: int = 2,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Path:
+    """Ensure a non-empty BAM index exists beside the resolved BAM path."""
+    log = logger or (lambda _msg: None)
+    bam_path = Path(bam_path).resolve()
+    if not bam_path.exists():
+        raise BamIndexError(f"BAM not found: {bam_path}")
+
+    existing = _find_bam_index_path(bam_path)
+    if existing is not None:
+        log(f"BAM index already present for {bam_path}: {existing}")
+        return existing
+
+    lock_path = bam_path.parent / f"{bam_path.name}.index.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        existing = _find_bam_index_path(bam_path)
+        if existing is not None:
+            log(f"BAM index present after lock for {bam_path}: {existing}")
+            return existing
+
+        thread_count = max(1, int(threads))
+        cmd = ["samtools", "index", f"-@{thread_count}", str(bam_path)]
+        log(f"Creating BAM index: {' '.join(cmd)}")
+        index_proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if index_proc.returncode != 0:
+            detail = (index_proc.stderr or index_proc.stdout or "").strip()
+            raise BamIndexError(
+                f"samtools index failed (exit {index_proc.returncode}) "
+                f"for {bam_path}: {detail}"
+            )
+
+        existing = _find_bam_index_path(bam_path)
+        if existing is None:
+            raise BamIndexError(
+                f"samtools index completed but no index found for {bam_path}"
+            )
+        log(f"Created BAM index for {bam_path}: {existing}")
+        return existing
+
+
+def _ensure_aligned_bam_alias(
+    work_dir: Path,
+    dedup_bam: Path,
+    threads: int,
+    logger: Optional[Callable[[str], None]] = None,
+) -> Path:
+    """Keep aligned.bam (+ .bai) as a compatibility alias to the indexed dedup BAM."""
+    log = logger or (lambda _msg: None)
+    dedup_bam = Path(dedup_bam).resolve()
+    _ensure_bam_index(dedup_bam, threads=threads, logger=log)
+    dedup_index = _find_bam_index_path(dedup_bam)
+    aligned_bam = work_dir / "aligned.bam"
+
+    if not aligned_bam.exists():
+        try:
+            aligned_bam.symlink_to(dedup_bam)
+            log(f"Created aligned.bam symlink -> {dedup_bam}")
+        except OSError:
+            shutil.copy2(dedup_bam, aligned_bam)
+            log(f"Copied dedup BAM to aligned.bam: {aligned_bam}")
+            _ensure_bam_index(aligned_bam, threads=threads, logger=log)
+
+    if dedup_index is not None:
+        aligned_index = Path(f"{aligned_bam}.bai")
+        if not aligned_index.exists():
+            try:
+                aligned_index.symlink_to(dedup_index)
+                log(f"Created aligned.bam.bai symlink -> {dedup_index}")
+            except OSError:
+                shutil.copy2(dedup_index, aligned_index)
+                log(f"Copied BAM index to {aligned_index}")
+
+    return aligned_bam
+
+
+def build_empty_miner_response(base_dir: Path) -> Dict[str, Any]:
+    """Schema-valid empty submission for miner forward error handling."""
+    config = _config_from_env(base_dir)
+    region_chrom = _region_chrom(DEFAULT_REGION) or "chr7"
+    contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
+    vcf_content = _build_submission_vcf(
+        [],
+        config.reference_header,
+        region_chrom,
+        contig_length,
+        config.enable_af_esp,
+    )
+    return {
+        "vcf_content": vcf_content,
+        "cftr_annotations": {},
+        "elapsed_time": 0.0,
+    }
 
 
 def process_cftr_task_for_miner(
@@ -106,10 +268,11 @@ def process_cftr_task_for_miner(
 
     task_dir = config.base_dir / "tasks" / safe_task_id
     reads_dir = config.base_dir / "reads" / safe_task_id
-    work_dir = config.base_dir / "work" / safe_task_id
+    work_dir = _task_work_dir(config.base_dir, safe_task_id)
     output_dir = config.base_dir / "outputs" / safe_task_id
     for directory in (task_dir, reads_dir, work_dir, output_dir):
         directory.mkdir(parents=True, exist_ok=True)
+    log(f"CFTR miner task {task_id}: work dir {work_dir} (instance={_miner_instance_id()})")
 
     task_json_path = task_dir / "task.json"
     task_json_path.write_text(json.dumps(task_data, indent=2, sort_keys=True), encoding="utf-8")
@@ -122,10 +285,14 @@ def process_cftr_task_for_miner(
 
     for tool in ("bwa", "samtools", "bcftools", "tabix"):
         _ensure_executable(tool)
-    if _use_gatk_caller(config) and not config.gatk_path.exists():
+    if not config.gatk_path.exists():
         raise FileNotFoundError(f"GATK executable not found: {config.gatk_path}")
     if not config.reference_fasta.exists():
         raise FileNotFoundError(f"Reference FASTA not found: {config.reference_fasta}")
+
+    expected_variant_count = int(task_data.get("expected_variant_count") or 0)
+    region_chrom = _region_chrom(region) or "chr7"
+    contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
 
     log(f"CFTR miner task {task_id}: preparing reference indexes")
     _ensure_reference_indexes(config, log)
@@ -137,131 +304,87 @@ def process_cftr_task_for_miner(
     dedup_bam = _prepare_dedup_bam_from_reads(
         config, read1_path, read2_path, work_dir, safe_task_id, log
     )
-    bam_path = work_dir / "aligned.bam"
-    if not bam_path.exists():
-        try:
-            bam_path.symlink_to(dedup_bam.resolve())
-        except OSError:
-            shutil.copy2(dedup_bam, bam_path)
-            _run_command(["samtools", "index", str(bam_path)], "index aligned BAM copy")
-
-    caller_raw_vcf = work_dir / "calls.gatk.raw.vcf.gz"
-    caller_plain_vcf = work_dir / "calls.gatk.vcf"
-    standard_raw_vcf = work_dir / "calls.standard.raw.vcf.gz"
-    standard_norm_vcf = work_dir / "calls.standard.norm.vcf.gz"
-    caller_source = "gatk"
-
-    if _use_gatk_caller(config):
-        log(f"CFTR miner task {task_id}: GATK HaplotypeCaller in {region}")
-        _call_gatk_haplotypecaller(config, dedup_bam, region, caller_raw_vcf)
-        _run_command(
-            ["bcftools", "view", "-Ov", "-o", str(caller_plain_vcf), str(caller_raw_vcf)],
-            "convert GATK VCF to plain text",
-        )
-        shutil.copy2(caller_raw_vcf, standard_raw_vcf)
-    else:
-        log(f"CFTR miner task {task_id}: bcftools mpileup/call in {region}")
-        caller_source = "standard"
-        _call_standard_variants(config, dedup_bam, region, standard_raw_vcf)
-
-    _run_command(["tabix", "-f", "-p", "vcf", str(standard_raw_vcf)], "index raw caller VCF")
-    _bcftools_norm_vcf(config.reference_fasta, standard_raw_vcf, standard_norm_vcf)
-    _run_command(["tabix", "-f", "-p", "vcf", str(standard_norm_vcf)], "index normalized caller VCF")
+    evidence_bam = Path(dedup_bam).resolve()
+    _ensure_bam_index(evidence_bam, threads=config.threads, logger=log)
+    log(f"CFTR miner task {task_id}: evidence BAM {evidence_bam}")
+    index_path = _find_bam_index_path(evidence_bam)
+    log(
+        f"CFTR miner task {task_id}: evidence index "
+        f"{'present' if index_path else 'missing'} "
+        f"({index_path if index_path else 'none'})"
+    )
+    bam_path = _ensure_aligned_bam_alias(
+        work_dir, evidence_bam, threads=config.threads, logger=log
+    )
 
     clinvar_panel = _load_merged_clinvar_panel(config.clinvar_panel)
     drug_panel = _load_drug_panel(config.drug_panel)
-
-    standard_variants: List[VariantRecord] = []
-    for variant in _parse_vcf_records(standard_norm_vcf, caller_source):
-        if _is_valid_allele(variant.ref) and _is_valid_allele(variant.alt):
-            standard_variants.append(variant)
-
-    caller_tsv = output_dir / "gatk_candidates.tsv"
-    if not _use_gatk_caller(config):
-        caller_tsv = output_dir / "bcftools_candidates.tsv"
-    _write_bcftools_candidates_tsv(caller_tsv, standard_variants)
-
-    log(f"CFTR miner task {task_id}: panel pileup scan")
-    panel_entries = _load_panel_variants_in_region(
-        config.clinvar_panel, region, config.base_dir
-    )
-    panel_variants = _panel_pileup_scan(bam_path, panel_entries, config)
-    panel_tsv = output_dir / "panel_pileup_candidates.tsv"
-    _write_panel_pileup_tsv(panel_tsv, panel_variants)
-
-    discovered_variants: List[VariantRecord] = []
-    if os.environ.get("NIOME_ENABLE_MPILEUP_DISCOVERY", "0").strip() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        discovered_variants = _discover_mpileup_snps(
-            bam_path, config.reference_fasta, region, config
-        )
-        log(
-            f"CFTR miner task {task_id}: mpileup discovery found "
-            f"{len(discovered_variants)} additional SNP candidates"
-        )
-    if os.environ.get("NIOME_ENABLE_HOM_DISCOVERY", "0").strip() in (
-        "1",
-        "true",
-        "yes",
-    ):
-        homozygous_discovered = _discover_homozygous_evidence_variants(
-            bam_path, config.reference_fasta, region, config
-        )
-        if homozygous_discovered:
-            log(
-                f"CFTR miner task {task_id}: homozygous evidence rescue found "
-                f"{len(homozygous_discovered)} candidate(s)"
-            )
-        discovered_variants.extend(homozygous_discovered)
 
     pop_lookup: Optional[PopulationAfLookup] = None
     if config.enable_af_esp:
         try:
             pop_lookup = _load_population_af_lookup(config)
             log(
-                f"CFTR miner task {task_id}: loaded gnomAD population AF cache "
+                f"CFTR miner task {task_id}: gnomAD cache for INFO/tie-break only "
                 f"({len(pop_lookup.by_allele)} alleles)"
             )
         except Exception as exc:
-            log(f"CFTR miner task {task_id}: population AF cache skipped: {exc}")
+            log(f"CFTR miner task {task_id}: gnomAD cache skipped: {exc}")
 
-    log(
-        f"CFTR miner task {task_id}: selecting variants "
-        f"({caller_source}-first, panel + gnomAD GT)"
-    )
-    selected_variants, review_rows = _select_variants(
-        standard_variants,
-        panel_variants,
-        discovered_variants,
-        clinvar_panel,
+    log(f"CFTR miner task {task_id}: collecting GATK HaplotypeCaller candidates")
+    raw_candidates, caller_paths = _collect_all_candidates(
         config,
-        pop_lookup=pop_lookup,
+        evidence_bam,
+        region,
+        work_dir,
+        clinvar_panel,
+        log,
     )
-    region_chrom = _region_chrom(region) or "chr7"
-    contig_length = _reference_contig_length(config.reference_fasta, region_chrom)
-    selected_variants = _harmonize_selected_variants_norm(
-        selected_variants,
+    log(f"CFTR miner task {task_id}: union {len(raw_candidates)} raw candidate allele(s)")
+
+    log(f"CFTR miner task {task_id}: normalizing candidate alleles (bcftools norm)")
+    normalized_candidates = _normalize_candidate_alleles(
+        raw_candidates,
         config,
         work_dir,
         region_chrom,
         contig_length,
         log,
-        clinvar_panel=clinvar_panel,
-        pop_lookup=pop_lookup,
     )
-    final_review_path = output_dir / "final_review.tsv"
-    _write_final_review_tsv(final_review_path, review_rows)
+    log(
+        f"CFTR miner task {task_id}: {len(normalized_candidates)} candidate(s) after norm"
+    )
 
-    if pop_lookup is not None:
-        annotate_variants_with_population_af(selected_variants, pop_lookup)
-        _refresh_variants_genotypes(selected_variants, clinvar_panel, pop_lookup)
-        log(
-            f"CFTR miner task {task_id}: refreshed genotypes using read evidence "
-            f"and gnomAD population AF"
-        )
+    log(f"CFTR miner task {task_id}: computing read evidence from BAM")
+    evidence_rows = _apply_evidence_engine(
+        normalized_candidates,
+        evidence_bam,
+        config,
+        region,
+        config.reference_fasta,
+        clinvar_panel,
+        log,
+    )
+    accepted = [row for row in evidence_rows if row.evidence_status == "ACCEPTED"]
+    rejected = len(evidence_rows) - len(accepted)
+    log(
+        f"CFTR miner task {task_id}: evidence filter {len(accepted)} accepted, "
+        f"{rejected} rejected"
+    )
+
+    log(
+        f"CFTR miner task {task_id}: ranking/selecting "
+        f"(expected_variant_count={expected_variant_count})"
+    )
+    selected_variants = _select_evidence_ranked_variants(
+        accepted,
+        expected_variant_count,
+        pop_lookup,
+        log,
+    )
+
+    evidence_tsv = output_dir / "candidate_evidence.tsv"
+    _write_candidate_evidence_tsv(evidence_tsv, evidence_rows)
 
     vcf_content = _prepare_submission_vcf(
         selected_variants,
@@ -272,9 +395,14 @@ def process_cftr_task_for_miner(
         log,
         pop_lookup=pop_lookup,
         clinvar_panel=clinvar_panel,
+        bam_path=evidence_bam,
+        region=region,
     )
     vcf_path = output_dir / "submission.vcf"
-    vcf_path.write_text(vcf_content, encoding="utf-8")
+    output_lock = output_dir / ".submission.write.lock"
+    with open(output_lock, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        vcf_path.write_text(vcf_content, encoding="utf-8")
 
     cftr_annotations = _build_cftr_annotations(
         selected_variants,
@@ -282,10 +410,12 @@ def process_cftr_task_for_miner(
         drug_panel,
     )
     annotation_path = output_dir / "annotation.json"
-    annotation_path.write_text(
-        json.dumps(cftr_annotations, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
+    with open(output_lock, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        annotation_path.write_text(
+            json.dumps(cftr_annotations, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     elapsed_time = time.time() - started_at
     log(
@@ -298,25 +428,23 @@ def process_cftr_task_for_miner(
         "cftr_annotations": cftr_annotations,
         "elapsed_time": elapsed_time,
         "counts": {
-            "gatk_candidates": len(standard_variants),
-            "bcftools_candidates": len(standard_variants),
-            "panel_pileup_candidates": len(panel_variants),
-            "panel_read_backed": sum(1 for variant in panel_variants if variant.read_backed),
+            "raw_candidates": len(raw_candidates),
+            "normalized_candidates": len(normalized_candidates),
+            "evidence_accepted": len(accepted),
+            "evidence_rejected": rejected,
             "submitted": len(selected_variants),
             "annotated": len(cftr_annotations),
+            "expected_variant_count": expected_variant_count,
         },
         "paths": {
             "task_json": str(task_json_path),
             "read1_fastq": str(read1_path),
             "read2_fastq": str(read2_path),
             "aligned_bam": str(bam_path),
-            "dedup_bam": str(dedup_bam),
-            "caller_plain_vcf": str(caller_plain_vcf) if caller_plain_vcf.exists() else "",
-            "standard_raw_vcf": str(standard_raw_vcf),
-            "standard_norm_vcf": str(standard_norm_vcf),
-            "caller_candidates_tsv": str(caller_tsv),
-            "panel_pileup_candidates_tsv": str(panel_tsv),
-            "final_review_tsv": str(final_review_path),
+            "dedup_bam": str(evidence_bam),
+            "evidence_bam": str(evidence_bam),
+            **caller_paths,
+            "candidate_evidence_tsv": str(evidence_tsv),
             "submission_vcf": str(vcf_path),
             "annotation_json": str(annotation_path),
         },
@@ -547,26 +675,27 @@ def _finalize_genotype(
     clinical_significance: str = "",
     pop_lookup: Optional[PopulationAfLookup] = None,
 ) -> str:
-    """Finalize GT using caller GT, read depth/AF, and gnomAD population AF."""
-    _attach_population_af(variant, pop_lookup)
-    caller_gt = None
-    if _is_primary_caller_source(variant.source):
-        caller_gt = _normalize_submission_gt(variant.gt)
-    evidence_gt = _promote_genotype_from_evidence(
-        variant, caller_gt, clinical_significance
+    """Finalize GT from BAM read evidence only (gnomAD does not set GT)."""
+    _ = clinical_significance
+    _ = pop_lookup
+    is_snp = _is_snp(variant.ref, variant.alt)
+    gt, _ = _gt_from_read_evidence_only(
+        variant.ref_depth,
+        variant.alt_depth,
+        variant.dp,
+        variant.af,
+        is_snp,
+        not is_snp,
+        ref=variant.ref,
+        alt=variant.alt,
+        clinical_significance=clinical_significance,
+        is_panel=variant.is_panel,
     )
-    gnomad_gt = _gt_from_gnomad(variant)
-    if gnomad_gt is None or not _is_primary_caller_source(variant.source):
-        return evidence_gt
-    if variant.alt_depth < 2:
-        return evidence_gt
-    if gnomad_gt == evidence_gt:
-        return gnomad_gt
-    if gnomad_gt == "1/1" and variant.af >= 0.38:
-        return "1/1"
-    if gnomad_gt == "0/1" and 0.10 <= variant.af <= 0.90:
-        return "0/1"
-    return evidence_gt
+    if gt:
+        return gt
+    if variant.gt and variant.gt not in ("0/0", "./.", "."):
+        return _normalize_submission_gt(variant.gt) or "0/1"
+    return "0/1"
 
 
 def _is_primary_caller_source(source: str) -> bool:
@@ -749,6 +878,886 @@ def count_snp_support_with_pysam(
     dp = ref_depth + alt_depth
     af = (alt_depth / dp) if dp > 0 else 0.0
     return ref_depth, alt_depth, dp, af
+
+
+def _compute_detailed_pileup_evidence(
+    bam: pysam.AlignmentFile,
+    contig: str,
+    pos: int,
+    ref: str,
+    alt: str,
+    config: CftrMinerConfig,
+) -> Tuple[int, int, int, float, bool, float, float]:
+    """Return ref/alt depths, AF, strand_balanced, mean_alt_bq, mean_mapq."""
+    if _is_snp(ref, alt):
+        return _compute_snp_pileup_metrics(bam, contig, pos, ref, alt, config)
+    ref_d, alt_d, dp, af = count_allele_support_with_pysam(
+        bam, contig, pos, ref, alt
+    )
+    strand_balanced = True
+    mean_bq = float(config.min_baseq)
+    mean_mq = float(config.min_mapq)
+    if alt_d >= 2:
+        strand_balanced = True
+    return ref_d, alt_d, dp, af, strand_balanced, mean_bq, mean_mq
+
+
+def _compute_snp_pileup_metrics(
+    bam: pysam.AlignmentFile,
+    contig: str,
+    pos: int,
+    ref: str,
+    alt: str,
+    config: CftrMinerConfig,
+) -> Tuple[int, int, int, float, bool, float, float]:
+    ref_upper = ref.upper()
+    alt_upper = alt.upper()
+    ref_depth = 0
+    alt_depth = 0
+    alt_forward = 0
+    alt_reverse = 0
+    bq_sum = 0.0
+    bq_count = 0
+    mq_sum = 0.0
+    mq_count = 0
+    min_bq = config.min_baseq
+    min_mq = config.min_mapq
+
+    for column in bam.pileup(
+        contig,
+        pos - 1,
+        pos,
+        truncate=True,
+        stepper="all",
+        min_base_quality=min_bq,
+        min_mapping_quality=min_mq,
+    ):
+        if column.reference_pos != pos - 1:
+            continue
+        for pileupread in column.pileups:
+            if pileupread.is_refskip or pileupread.is_del:
+                continue
+            query_position = pileupread.query_position
+            if query_position is None:
+                continue
+            aln = pileupread.alignment
+            query_sequence = aln.query_sequence
+            if query_sequence is None or query_position >= len(query_sequence):
+                continue
+            base = query_sequence[query_position].upper()
+            if aln.mapping_quality < min_mq:
+                continue
+            if base == ref_upper:
+                ref_depth += 1
+            elif base == alt_upper:
+                alt_depth += 1
+                if aln.is_reverse:
+                    alt_reverse += 1
+                else:
+                    alt_forward += 1
+                if aln.query_qualities and query_position < len(aln.query_qualities):
+                    bq_sum += aln.query_qualities[query_position]
+                    bq_count += 1
+                mq_sum += aln.mapping_quality
+                mq_count += 1
+
+    dp = ref_depth + alt_depth
+    af = (alt_depth / dp) if dp > 0 else 0.0
+    strand_balanced = True
+    if alt_depth >= 2:
+        minor = min(alt_forward, alt_reverse)
+        major = max(alt_forward, alt_reverse)
+        strand_balanced = minor >= 1 and (minor / major) >= 0.25
+    mean_bq = (bq_sum / bq_count) if bq_count else float(min_bq)
+    mean_mq = (mq_sum / mq_count) if mq_count else float(min_mq)
+    return ref_depth, alt_depth, dp, af, strand_balanced, mean_bq, mean_mq
+
+
+def _variant_in_region(variant: VariantRecord, region: str) -> bool:
+    chrom, start, end = _parse_region_bounds(region)
+    if chrom_core(variant.chrom) != chrom_core(chrom):
+        return False
+    return start <= variant.pos <= end
+
+
+def _check_ref_match(
+    variant: VariantRecord,
+    fasta: pysam.FastaFile,
+) -> bool:
+    contig = _resolve_reference_contig(fasta, variant.chrom)
+    if contig is None:
+        return False
+    ref_seq = _reference_bases_at(fasta, contig, variant.pos, len(variant.ref))
+    return ref_seq is not None and ref_seq == variant.ref
+
+
+def _caller_support_count(variant: VariantRecord) -> int:
+    return sum(
+        (
+            bool(variant.source_gatk),
+            bool(variant.source_bcftools),
+            bool(variant.source_assembly),
+            bool(variant.source_panel_probe),
+        )
+    )
+
+
+def _primary_caller_count(variant: VariantRecord) -> int:
+    """GATK + bcftools only (used for SNV AF relax, not assembly/panel)."""
+    return int(bool(variant.source_gatk)) + int(bool(variant.source_bcftools))
+
+
+def _is_relaxed_indel_evidence(variant: VariantRecord, is_indel: bool) -> bool:
+    if not is_indel:
+        return False
+    if variant.source == "mpileup_indel_discovery":
+        return True
+    return bool(
+        variant.source_assembly
+        and not variant.source_gatk
+        and not variant.source_bcftools
+        and variant.alt_depth >= 2
+        and len(variant.alt) - len(variant.ref) <= 3
+    )
+
+
+def _gt_from_read_evidence_only(
+    ref_depth: int,
+    alt_depth: int,
+    dp: int,
+    af: float,
+    is_snp: bool,
+    is_indel: bool,
+    caller_count: int = 0,
+    primary_caller_count: int = 0,
+    panel_backed: bool = False,
+    relaxed_indel: bool = False,
+    ref: str = "",
+    alt: str = "",
+    clinical_significance: str = "",
+    is_panel: bool = False,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Evidence filter + GT from BAM AD/AF (GT uses validator-aligned infer_gt_from_depth)."""
+    if alt_depth < EVIDENCE_MIN_ALT_DEPTH:
+        return None, "reject_alt_depth_lt_2"
+    if dp < EVIDENCE_MIN_DP:
+        return None, "reject_dp_lt_3"
+    min_af = EVIDENCE_MIN_AF
+    if relaxed_indel and is_indel and alt_depth >= 2:
+        min_af = min(min_af, 0.10)
+    if panel_backed and is_indel and alt_depth >= 2:
+        min_af = min(min_af, 0.10)
+    if af < min_af:
+        return None, "reject_af_lt_min"
+
+    snv_min_af = EVIDENCE_SNV_MIN_AF
+    if primary_caller_count >= 2 and alt_depth >= 3:
+        snv_min_af = min(snv_min_af, 0.15)
+    if primary_caller_count >= 2 and alt_depth >= 4:
+        snv_min_af = min(snv_min_af, 0.12)
+    if panel_backed and primary_caller_count >= 1 and alt_depth >= 3:
+        snv_min_af = min(snv_min_af, 0.15)
+
+    if is_snp and af < snv_min_af and dp > EVIDENCE_LOW_DP_HET_MAX_DP:
+        return None, "reject_snv_af_lt_0.18"
+    if is_indel:
+        if relaxed_indel and alt_depth >= 2 and af >= min_af:
+            pass
+        else:
+            multi_caller_indel = (
+                caller_count >= 2 and alt_depth >= 2 and af >= min_af
+            )
+            if not multi_caller_indel:
+                if alt_depth < EVIDENCE_INDEL_MIN_ALT_DEPTH and af < EVIDENCE_INDEL_MIN_AF:
+                    return None, "reject_indel_weak_support"
+                if af < EVIDENCE_INDEL_MIN_AF and dp > EVIDENCE_LOW_DP_HET_MAX_DP:
+                    return None, "reject_indel_af_lt_0.20"
+
+    if dp <= EVIDENCE_LOW_DP_HET_MAX_DP:
+        if alt_depth >= EVIDENCE_MIN_ALT_DEPTH and af >= EVIDENCE_LOW_DP_HET_MIN_AF:
+            return (
+                infer_gt_from_depth(
+                    ref_depth,
+                    alt_depth,
+                    clinical_significance,
+                    ref=ref,
+                    alt=alt,
+                    is_panel=is_panel or panel_backed,
+                ),
+                None,
+            )
+        return None, "reject_low_dp_insufficient_af"
+
+    het_min_af = GT_HET_MIN_AF
+    if is_snp and alt_depth >= 7:
+        het_min_af = min(het_min_af, 0.18)
+    if is_snp and caller_count >= 2 and alt_depth >= 4:
+        het_min_af = min(het_min_af, 0.15)
+    if is_snp and primary_caller_count >= 2 and alt_depth >= 3:
+        het_min_af = min(het_min_af, 0.15)
+    if is_indel and primary_caller_count >= 2 and alt_depth >= 2:
+        het_min_af = min(het_min_af, 0.15)
+    if panel_backed and alt_depth >= 3:
+        het_min_af = min(het_min_af, 0.15)
+    if panel_backed and is_indel and alt_depth >= 2:
+        het_min_af = min(het_min_af, 0.10)
+    if relaxed_indel and alt_depth >= 2:
+        het_min_af = min(het_min_af, 0.10)
+
+    if af < het_min_af:
+        return None, "reject_af_below_het_threshold"
+    return (
+        infer_gt_from_depth(
+            ref_depth,
+            alt_depth,
+            clinical_significance,
+            ref=ref,
+            alt=alt,
+            is_panel=is_panel or panel_backed,
+        ),
+        None,
+    )
+
+
+def _hard_reject_evidence(
+    variant: VariantRecord,
+    region: str,
+    ref_match: bool,
+) -> Optional[str]:
+    if not _variant_in_region(variant, region):
+        return "reject_outside_region"
+    if not ref_match:
+        return "reject_ref_mismatch"
+    if not _is_submission_sized_allele(variant.ref) or not _is_submission_sized_allele(
+        variant.alt
+    ):
+        return "reject_invalid_allele"
+    if variant.ref_depth < 2:
+        return "reject_insufficient_ref_depth"
+    if variant.alt_depth == 0:
+        return "reject_alt_depth_zero"
+    if variant.af <= 0.0:
+        return "reject_af_zero"
+    if variant.source_panel_probe and variant.alt_depth < EVIDENCE_MIN_ALT_DEPTH:
+        return "reject_panel_no_alt_reads"
+    return None
+
+
+def _compute_evidence_confidence_score(variant: VariantRecord) -> float:
+    score = 0.0
+    score += min(40.0, variant.alt_depth * 5)
+    score += min(25.0, variant.af * 25.0)
+    if variant.source_gatk:
+        score += 10.0
+    if variant.source_bcftools:
+        score += 10.0
+    if variant.source_assembly:
+        score += 15.0
+    if (
+        variant.source_assembly
+        and not _is_snp(variant.ref, variant.alt)
+        and variant.alt_depth >= 2
+        and variant.af >= 0.10
+    ):
+        score += 20.0
+    if variant.source_panel_probe or variant.is_panel:
+        score += 15.0
+    score += max(0, _caller_support_count(variant) - 1) * 8.0
+    if variant.strand_balanced:
+        score += 5.0
+    if variant.mean_mapq >= 20:
+        score += 5.0
+    if variant.mean_alt_bq >= 20:
+        score += 5.0
+    return score
+
+
+def _merge_candidate_into_pool(
+    pool: Dict[Tuple[str, int, str, str], VariantRecord],
+    incoming: VariantRecord,
+) -> None:
+    key = _variant_key(incoming)
+    existing = pool.get(key)
+    if existing is None:
+        pool[key] = incoming
+        return
+    existing.source_gatk = existing.source_gatk or incoming.source_gatk
+    existing.source_bcftools = existing.source_bcftools or incoming.source_bcftools
+    existing.source_assembly = existing.source_assembly or incoming.source_assembly
+    existing.source_panel_probe = (
+        existing.source_panel_probe or incoming.source_panel_probe
+    )
+    existing.is_panel = existing.is_panel or incoming.is_panel
+    if incoming.variation_id and not existing.variation_id:
+        existing.variation_id = incoming.variation_id
+    if incoming.qual is not None and (
+        existing.qual is None or incoming.qual > existing.qual
+    ):
+        existing.qual = incoming.qual
+    if incoming.alt_depth > existing.alt_depth:
+        existing.ref_depth = incoming.ref_depth
+        existing.alt_depth = incoming.alt_depth
+        existing.dp = incoming.dp
+        existing.af = incoming.af
+        existing.gt = incoming.gt
+    if incoming.evidence_score > existing.evidence_score:
+        existing.evidence_score = incoming.evidence_score
+        existing.evidence_status = incoming.evidence_status
+        existing.evidence_reason = incoming.evidence_reason
+
+
+def _dedupe_variants_by_key(variants: List[VariantRecord]) -> List[VariantRecord]:
+    pool: Dict[Tuple[str, int, str, str], VariantRecord] = {}
+    for variant in variants:
+        _merge_candidate_into_pool(pool, variant)
+    return sorted(
+        pool.values(),
+        key=lambda item: (_chrom_sort_key(item.chrom), item.pos, item.ref, item.alt),
+    )
+
+
+def _variants_from_vcf_path(vcf_path: Path, source_label: str) -> List[VariantRecord]:
+    records: List[VariantRecord] = []
+    for variant in _parse_vcf_records(vcf_path, source_label):
+        if not _is_valid_allele(variant.ref) or not _is_valid_allele(variant.alt):
+            continue
+        if source_label == "gatk":
+            variant.source_gatk = True
+        elif source_label in ("bcftools", "standard"):
+            variant.source_bcftools = True
+        elif source_label == "assembly":
+            variant.source_assembly = True
+        records.append(variant)
+    return records
+
+
+def _collect_all_candidates(
+    config: CftrMinerConfig,
+    bam_path: Path,
+    region: str,
+    work_dir: Path,
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    logger: Callable[[str], None],
+) -> Tuple[List[VariantRecord], Dict[str, str]]:
+    """Collect variant candidates from GATK HaplotypeCaller only."""
+    _ = clinvar_panel
+    log = logger
+    paths: Dict[str, str] = {}
+    pool: Dict[Tuple[str, int, str, str], VariantRecord] = {}
+
+    gatk_raw = work_dir / "calls.gatk.raw.vcf.gz"
+    gatk_plain = work_dir / "calls.gatk.vcf"
+    log("Running GATK HaplotypeCaller")
+    _call_gatk_haplotypecaller(config, bam_path, region, gatk_raw)
+    _run_command(
+        ["bcftools", "view", "-Ov", "-o", str(gatk_plain), str(gatk_raw)],
+        "convert GATK VCF to plain text",
+    )
+    paths["gatk_raw_vcf"] = str(gatk_raw)
+    paths["gatk_plain_vcf"] = str(gatk_plain)
+    gatk_variants = _variants_from_vcf_path(gatk_plain, "gatk")
+    for variant in gatk_variants:
+        _merge_candidate_into_pool(pool, variant)
+    log(f"GATK contributed {len(gatk_variants)} allele(s)")
+
+    return list(pool.values()), paths
+
+
+def _discover_mpileup_snaps_for_evidence(
+    bam_path: Path,
+    reference_fasta: Path,
+    region: str,
+    config: CftrMinerConfig,
+) -> List[VariantRecord]:
+    """Local assembly-style discovery (mpileup SNPs + indels + pileup confirm)."""
+    discovered = _discover_mpileup_snps(bam_path, reference_fasta, region, config)
+    for variant in discovered:
+        variant.source = "assembly"
+        variant.source_assembly = True
+        if variant.alt_depth >= EVIDENCE_MIN_ALT_DEPTH and variant.af > 0:
+            variant.read_backed = True
+    return [v for v in discovered if v.alt_depth >= 1]
+
+
+def _probe_panel_candidates_with_reads(
+    bam_path: Path,
+    panel_entries: List[PanelVariant],
+    config: CftrMinerConfig,
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    reference_fasta: Path,
+) -> List[VariantRecord]:
+    """Panel is probe-only: only enter pool when ALT reads exist (>=2, AF>0)."""
+    probed: List[VariantRecord] = []
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
+        str(reference_fasta)
+    ) as fasta:
+        for entry in panel_entries:
+            if not _is_submission_sized_allele(entry.ref) or not _is_submission_sized_allele(
+                entry.alt
+            ):
+                continue
+            contig = _resolve_bam_contig(bam, entry.chrom)
+            if contig is None:
+                continue
+            probe_variant = VariantRecord(
+                chrom=_vcf_chrom(contig),
+                pos=entry.pos,
+                ref=entry.ref,
+                alt=entry.alt,
+                filter_value="PASS",
+                gt="0/1",
+                source="panel_probe",
+            )
+            if not _check_ref_match(probe_variant, fasta):
+                continue
+            (
+                ref_d,
+                alt_d,
+                dp,
+                af,
+                _strand,
+                _bq,
+                _mq,
+            ) = _compute_detailed_pileup_evidence(
+                bam, contig, entry.pos, entry.ref, entry.alt, config
+            )
+            if (
+                ref_d < 2
+                or alt_d < EVIDENCE_MIN_ALT_DEPTH
+                or af <= 0.0
+                or af >= 0.98
+            ):
+                continue
+            panel_entry = clinvar_panel.get(
+                (chrom_core(entry.chrom), entry.pos, entry.ref, entry.alt), {}
+            )
+            probed.append(
+                VariantRecord(
+                    chrom=_vcf_chrom(contig),
+                    pos=entry.pos,
+                    ref=entry.ref,
+                    alt=entry.alt,
+                    filter_value="PASS",
+                    gt="0/1",
+                    dp=dp,
+                    ref_depth=ref_d,
+                    alt_depth=alt_d,
+                    af=af,
+                    source="panel_probe",
+                    variation_id=entry.variation_id,
+                    is_panel=True,
+                    read_backed=True,
+                    source_panel_probe=True,
+                )
+            )
+            if panel_entry and not probed[-1].variation_id:
+                probed[-1].variation_id = str(panel_entry.get("variation_id", ""))
+    return probed
+
+
+def _write_candidates_vcf(
+    variants: List[VariantRecord],
+    output_path: Path,
+    sample_name: str = "SAMPLE",
+    contig_id: Optional[str] = None,
+    contig_length: Optional[int] = None,
+    reference_fasta: Optional[Path] = None,
+) -> None:
+    chroms = {_vcf_chrom(v.chrom) for v in variants}
+    primary = contig_id or (sorted(chroms)[0] if chroms else "chr7")
+    header = [
+        "##fileformat=VCFv4.2",
+        f"##contig=<ID={primary},length={contig_length or 159345973}>",
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+    ]
+    if reference_fasta is not None:
+        header.insert(1, f"##reference={reference_fasta.resolve().as_posix()}")
+    for extra in sorted(chroms - {primary}):
+        header.append(f"##contig=<ID={extra},length={contig_length or 159345973}>")
+    header.append(
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + sample_name
+    )
+    rows = []
+    for variant in sorted(
+        variants,
+        key=lambda item: (_chrom_sort_key(item.chrom), item.pos, item.ref, item.alt),
+    ):
+        qual = "." if variant.qual is None else f"{variant.qual:g}"
+        rows.append(
+            "\t".join(
+                [
+                    _vcf_chrom(variant.chrom),
+                    str(variant.pos),
+                    ".",
+                    variant.ref,
+                    variant.alt,
+                    qual,
+                    "PASS",
+                    ".",
+                    "GT",
+                    variant.gt if variant.gt not in ("", ".") else "0/1",
+                ]
+            )
+        )
+    output_path.write_text("\n".join(header + rows) + "\n", encoding="utf-8")
+
+
+def _normalize_candidate_alleles(
+    variants: List[VariantRecord],
+    config: CftrMinerConfig,
+    work_dir: Path,
+    contig_id: str,
+    contig_length: Optional[int],
+    logger: Callable[[str], None],
+) -> List[VariantRecord]:
+    log = logger
+    if not variants:
+        return []
+    meta_by_key = {_variant_key(item): item for item in variants}
+    raw_vcf = work_dir / "candidates.merge.vcf"
+    norm_vcf = work_dir / "candidates.merge.norm.vcf.gz"
+    _write_candidates_vcf(
+        variants,
+        raw_vcf,
+        contig_id=contig_id,
+        contig_length=contig_length,
+        reference_fasta=config.reference_fasta,
+    )
+    _bcftools_norm_vcf(config.reference_fasta, raw_vcf, norm_vcf)
+    _run_command(["tabix", "-f", "-p", "vcf", str(norm_vcf)], "index merged candidate VCF")
+
+    normalized: List[VariantRecord] = []
+    for variant in _parse_vcf_records(norm_vcf, "candidate_norm"):
+        key = _variant_key(variant)
+        meta = meta_by_key.get(key)
+        if meta is None:
+            pos_key = (chrom_core(variant.chrom), variant.pos)
+            for item in variants:
+                if (chrom_core(item.chrom), item.pos) == pos_key:
+                    meta = item
+                    break
+        if meta is not None:
+            variant.source_gatk = meta.source_gatk
+            variant.source_bcftools = meta.source_bcftools
+            variant.source_assembly = meta.source_assembly
+            variant.source_panel_probe = meta.source_panel_probe
+            variant.is_panel = meta.is_panel
+            variant.variation_id = meta.variation_id
+            variant.qual = meta.qual
+            variant.source = _candidate_source_label(variant)
+        normalized.append(variant)
+    deduped = _dedupe_variants_by_key(normalized)
+    log(
+        f"Candidate normalization: {len(variants)} raw -> {len(normalized)} norm "
+        f"-> {len(deduped)} deduped allele(s)"
+    )
+    return deduped
+
+
+def _candidate_source_label(variant: VariantRecord) -> str:
+    parts: List[str] = []
+    if variant.source_gatk:
+        parts.append("gatk")
+    if variant.source_bcftools:
+        parts.append("bcftools")
+    if variant.source_assembly:
+        parts.append("assembly")
+    if variant.source_panel_probe:
+        parts.append("panel")
+    return "+".join(parts) if parts else variant.source
+
+
+def _apply_evidence_engine(
+    variants: List[VariantRecord],
+    bam_path: Path,
+    config: CftrMinerConfig,
+    region: str,
+    reference_fasta: Path,
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    logger: Callable[[str], None],
+) -> List[VariantRecord]:
+    log = logger
+    bam_path = Path(bam_path).resolve()
+    log(f"Evidence engine opening BAM: {bam_path}")
+    index_before = _find_bam_index_path(bam_path)
+    log(
+        f"Evidence index before ensure: "
+        f"{'found ' + str(index_before) if index_before else 'missing'}"
+    )
+    _ensure_bam_index(
+        bam_path,
+        threads=getattr(config, "threads", 2),
+        logger=log,
+    )
+    index_path = _find_bam_index_path(bam_path)
+    log(f"Evidence index ready: {index_path}")
+    if not bam_path.exists():
+        raise BamIndexError(f"Evidence BAM missing: {bam_path}")
+    if not _has_valid_bam_index(bam_path):
+        raise BamIndexError(f"Evidence BAM has no valid index: {bam_path}")
+
+    results: List[VariantRecord] = []
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
+        str(reference_fasta)
+    ) as fasta:
+        for variant in variants:
+            key = _variant_key(variant)
+            panel_entry = clinvar_panel.get(key, {})
+            if panel_entry:
+                variant.is_panel = True
+                if not variant.variation_id:
+                    variant.variation_id = str(panel_entry.get("variation_id", ""))
+
+            contig = _resolve_bam_contig(bam, variant.chrom)
+            if contig is None:
+                variant.evidence_status = "REJECTED"
+                variant.evidence_reason = "reject_no_bam_contig"
+                variant.evidence_score = 0.0
+                results.append(variant)
+                log(
+                    f"REJECT {variant.chrom}:{variant.pos} {variant.ref}>{variant.alt}: "
+                    f"{variant.evidence_reason}"
+                )
+                continue
+
+            (
+                ref_d,
+                alt_d,
+                dp,
+                af,
+                strand_balanced,
+                mean_bq,
+                mean_mq,
+            ) = _compute_detailed_pileup_evidence(
+                bam, contig, variant.pos, variant.ref, variant.alt, config
+            )
+            variant.ref_depth = ref_d
+            variant.alt_depth = alt_d
+            variant.dp = dp
+            variant.af = af
+            variant.ad = f"{ref_d},{alt_d}"
+            variant.strand_balanced = strand_balanced
+            variant.mean_alt_bq = mean_bq
+            variant.mean_mapq = mean_mq
+            variant.read_backed = alt_d >= EVIDENCE_MIN_ALT_DEPTH and af > 0
+            variant.ref_match = _check_ref_match(variant, fasta)
+
+            hard_reason = _hard_reject_evidence(variant, region, variant.ref_match)
+            is_snp = _is_snp(variant.ref, variant.alt)
+            is_indel = not is_snp
+
+            if hard_reason:
+                variant.evidence_status = "REJECTED"
+                variant.evidence_reason = hard_reason
+            else:
+                caller_count = _caller_support_count(variant)
+                primary_caller_count = _primary_caller_count(variant)
+                panel_backed = bool(
+                    variant.source_panel_probe or variant.is_panel
+                )
+                gt, gt_reason = _gt_from_read_evidence_only(
+                    ref_d,
+                    alt_d,
+                    dp,
+                    af,
+                    is_snp,
+                    is_indel,
+                    caller_count=caller_count,
+                    primary_caller_count=primary_caller_count,
+                    panel_backed=panel_backed,
+                    relaxed_indel=_is_relaxed_indel_evidence(variant, is_indel),
+                    ref=variant.ref,
+                    alt=variant.alt,
+                    clinical_significance=str(
+                        panel_entry.get("clinical_significance", "")
+                    ),
+                    is_panel=bool(variant.is_panel),
+                )
+                if gt is None:
+                    variant.evidence_status = "REJECTED"
+                    variant.evidence_reason = gt_reason or "reject_gt"
+                else:
+                    variant.gt = gt
+                    variant.evidence_status = "ACCEPTED"
+                    variant.evidence_reason = "accepted_read_evidence"
+
+            variant.evidence_score = _compute_evidence_confidence_score(variant)
+            results.append(variant)
+            log(
+                f"{variant.evidence_status} {variant.chrom}:{variant.pos} "
+                f"{variant.ref}>{variant.alt} src={_candidate_source_label(variant)} "
+                f"AD={variant.ad} AF={variant.af:.3f} GT={variant.gt} "
+                f"score={variant.evidence_score:.0f} reason={variant.evidence_reason}"
+            )
+    return results
+
+
+def _gnomad_ranking_prior(
+    variant: VariantRecord,
+    pop_lookup: Optional[PopulationAfLookup],
+) -> float:
+    """Tie-breaker only — never used for GT or inclusion."""
+    if pop_lookup is None:
+        return 0.0
+    af_esp = pop_lookup.lookup(
+        variant.chrom, variant.pos, variant.ref, variant.alt
+    )
+    variant.af_esp = af_esp
+    if af_esp is None:
+        return 0.0
+    return float(af_esp)
+
+
+def _select_evidence_ranked_variants(
+    accepted: List[VariantRecord],
+    expected_variant_count: int,
+    pop_lookup: Optional[PopulationAfLookup],
+    logger: Callable[[str], None],
+) -> List[VariantRecord]:
+    log = logger
+    if not accepted:
+        log("No read-supported candidates; submitting empty VCF")
+        return []
+
+    accepted = _dedupe_variants_by_key(accepted)
+
+    for variant in accepted:
+        _gnomad_ranking_prior(variant, pop_lookup)
+
+    ranked = sorted(
+        accepted,
+        key=lambda item: (
+            -int(item.is_panel or item.source_panel_probe),
+            -_caller_support_count(item),
+            -item.evidence_score,
+            -item.alt_depth,
+            -item.af,
+            -_gnomad_ranking_prior(item, pop_lookup),
+            item.pos,
+        ),
+    )
+
+    if expected_variant_count <= 0:
+        log(f"Keeping all {len(ranked)} read-supported candidate(s)")
+        return ranked
+
+    if len(ranked) <= expected_variant_count:
+        log(
+            f"Read-supported {len(ranked)} <= expected {expected_variant_count}; "
+            f"submitting all (no unsupported fill)"
+        )
+        return ranked
+
+    panel_first = [v for v in ranked if v.is_panel or v.source_panel_probe]
+    other = [v for v in ranked if v not in panel_first]
+    kept = (panel_first + other)[:expected_variant_count]
+    log(
+        f"Trimmed to expected_variant_count={expected_variant_count} "
+        f"from {len(ranked)} supported ({len(panel_first)} panel-prioritized)"
+    )
+    return kept
+
+
+def _write_candidate_evidence_tsv(
+    path: Path,
+    variants: List[VariantRecord],
+) -> None:
+    columns = [
+        "CHROM",
+        "POS",
+        "REF",
+        "ALT",
+        "source_gatk",
+        "source_bcftools",
+        "source_assembly",
+        "source_panel",
+        "REF_DEPTH",
+        "ALT_DEPTH",
+        "DP",
+        "AF",
+        "GT",
+        "SCORE",
+        "STATUS",
+        "REASON",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns, delimiter="\t")
+        writer.writeheader()
+        for variant in sorted(
+            variants,
+            key=lambda item: (_chrom_sort_key(item.chrom), item.pos, item.ref, item.alt),
+        ):
+            writer.writerow(
+                {
+                    "CHROM": _vcf_chrom(variant.chrom),
+                    "POS": variant.pos,
+                    "REF": variant.ref,
+                    "ALT": variant.alt,
+                    "source_gatk": "1" if variant.source_gatk else "0",
+                    "source_bcftools": "1" if variant.source_bcftools else "0",
+                    "source_assembly": "1" if variant.source_assembly else "0",
+                    "source_panel": "1" if variant.source_panel_probe else "0",
+                    "REF_DEPTH": variant.ref_depth,
+                    "ALT_DEPTH": variant.alt_depth,
+                    "DP": variant.dp,
+                    "AF": f"{variant.af:.4f}",
+                    "GT": variant.gt,
+                    "SCORE": f"{variant.evidence_score:.1f}",
+                    "STATUS": variant.evidence_status or "PENDING",
+                    "REASON": variant.evidence_reason,
+                }
+            )
+
+
+def _recompute_submission_evidence_from_bam(
+    variants: List[VariantRecord],
+    bam_path: Path,
+    config: CftrMinerConfig,
+    region: str,
+    reference_fasta: Path,
+) -> None:
+    """After final norm, refresh AD/AF/GT from BAM (never gnomAD)."""
+    bam_path = Path(bam_path).resolve()
+    _ensure_bam_index(bam_path, threads=getattr(config, "threads", 2))
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam, pysam.FastaFile(
+        str(reference_fasta)
+    ) as fasta:
+        for variant in variants:
+            contig = _resolve_bam_contig(bam, variant.chrom)
+            if contig is None:
+                continue
+            ref_d, alt_d, dp, af, strand_balanced, mean_bq, mean_mq = (
+                _compute_detailed_pileup_evidence(
+                    bam, contig, variant.pos, variant.ref, variant.alt, config
+                )
+            )
+            variant.ref_depth = ref_d
+            variant.alt_depth = alt_d
+            variant.dp = dp
+            variant.af = af
+            variant.ad = f"{ref_d},{alt_d}"
+            variant.strand_balanced = strand_balanced
+            variant.mean_alt_bq = mean_bq
+            variant.mean_mapq = mean_mq
+            variant.ref_match = _check_ref_match(variant, fasta)
+            is_snp = _is_snp(variant.ref, variant.alt)
+            gt, _ = _gt_from_read_evidence_only(
+                ref_d,
+                alt_d,
+                dp,
+                af,
+                is_snp,
+                not is_snp,
+                caller_count=_caller_support_count(variant),
+                primary_caller_count=_primary_caller_count(variant),
+                panel_backed=bool(variant.source_panel_probe or variant.is_panel),
+                relaxed_indel=_is_relaxed_indel_evidence(variant, not is_snp),
+                ref=variant.ref,
+                alt=variant.alt,
+                is_panel=bool(variant.is_panel),
+            )
+            if gt:
+                variant.gt = gt
 
 
 def _config_from_env(base_dir: Path) -> CftrMinerConfig:
@@ -1096,57 +2105,62 @@ def _prepare_dedup_bam_from_reads(
     sorted_bam = work_dir / "sorted.bam"
     rg_bam = work_dir / "rg.bam"
     dedup_bam = work_dir / "dedup.bam"
+    build_lock = work_dir / ".bam_build.lock"
+    build_lock.parent.mkdir(parents=True, exist_ok=True)
 
-    if dedup_bam.exists() and Path(f"{dedup_bam}.bai").exists():
-        return dedup_bam
+    with open(build_lock, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        if dedup_bam.exists() and _has_valid_bam_index(dedup_bam):
+            log(f"Reusing indexed dedup BAM: {dedup_bam.resolve()}")
+            return dedup_bam.resolve()
 
-    if not sorted_bam.exists() or not Path(f"{sorted_bam}.bai").exists():
-        log("Running bwa mem | samtools sort")
-        _align_reads(config, read1_path, read2_path, sorted_bam)
-        _run_command(["samtools", "index", str(sorted_bam)], "index sorted BAM")
+        if not sorted_bam.exists() or not _has_valid_bam_index(sorted_bam):
+            log("Running bwa mem | samtools sort")
+            _align_reads(config, read1_path, read2_path, sorted_bam)
+            _ensure_bam_index(sorted_bam, threads=config.threads, logger=log)
 
-    if not rg_bam.exists() or not Path(f"{rg_bam}.bai").exists():
-        log("Running GATK AddOrReplaceReadGroups")
-        _run_gatk(
-            config,
-            "AddOrReplaceReadGroups",
-            [
-                "-I",
-                str(sorted_bam),
-                "-O",
-                str(rg_bam),
-                "-RGID",
-                "1",
-                "-RGLB",
-                "lib1",
-                "-RGPL",
-                "ILLUMINA",
-                "-RGPU",
-                "unit1",
-                "-RGSM",
-                sample_name,
-            ],
-        )
-        _run_command(["samtools", "index", str(rg_bam)], "index RG BAM")
+        if not rg_bam.exists() or not _has_valid_bam_index(rg_bam):
+            log("Running GATK AddOrReplaceReadGroups")
+            _run_gatk(
+                config,
+                "AddOrReplaceReadGroups",
+                [
+                    "-I",
+                    str(sorted_bam),
+                    "-O",
+                    str(rg_bam),
+                    "-RGID",
+                    "1",
+                    "-RGLB",
+                    "lib1",
+                    "-RGPL",
+                    "ILLUMINA",
+                    "-RGPU",
+                    "unit1",
+                    "-RGSM",
+                    sample_name,
+                ],
+            )
+            _ensure_bam_index(rg_bam, threads=config.threads, logger=log)
 
-    if not dedup_bam.exists() or not Path(f"{dedup_bam}.bai").exists():
-        metrics_path = work_dir / "markdup_metrics.txt"
-        log("Running GATK MarkDuplicates")
-        _run_gatk(
-            config,
-            "MarkDuplicates",
-            [
-                "-I",
-                str(rg_bam),
-                "-O",
-                str(dedup_bam),
-                "-M",
-                str(metrics_path),
-            ],
-        )
-        _run_command(["samtools", "index", str(dedup_bam)], "index deduplicated BAM")
+        if not dedup_bam.exists() or not _has_valid_bam_index(dedup_bam):
+            metrics_path = work_dir / "markdup_metrics.txt"
+            log("Running GATK MarkDuplicates")
+            _run_gatk(
+                config,
+                "MarkDuplicates",
+                [
+                    "-I",
+                    str(rg_bam),
+                    "-O",
+                    str(dedup_bam),
+                    "-M",
+                    str(metrics_path),
+                ],
+            )
+            _ensure_bam_index(dedup_bam, threads=config.threads, logger=log)
 
-    return dedup_bam
+    return dedup_bam.resolve()
 
 
 def _call_gatk_haplotypecaller(
@@ -1431,13 +2445,15 @@ def _parse_submission_norm_vcf(
                 record.qual = evidence.qual
                 record.is_panel = evidence.is_panel
                 record.source = evidence.source
+                record.source_gatk = evidence.source_gatk
+                record.source_bcftools = evidence.source_bcftools
+                record.source_assembly = evidence.source_assembly
+                record.source_panel_probe = evidence.source_panel_probe
                 if record.af_esp is None:
                     record.af_esp = evidence.af_esp
-                panel_entry = (clinvar_panel or {}).get(_variant_key(record), {})
-                clin_sig = panel_entry.get("clinical_significance", "")
-                record.gt = _finalize_genotype(record, clin_sig, pop_lookup)
+                record.gt = evidence.gt
             records.append(record)
-    return records
+    return _dedupe_variants_by_key(records)
 
 
 def _refresh_variants_genotypes(
@@ -1445,12 +2461,26 @@ def _refresh_variants_genotypes(
     clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
     pop_lookup: Optional[PopulationAfLookup] = None,
 ) -> None:
-    """Re-assign GT from read depth/AF and gnomAD after merges or normalization."""
+    """Re-assign GT from read depth/AF only (gnomAD ignored for genotype)."""
+    _ = pop_lookup
     for variant in variants:
+        is_snp = _is_snp(variant.ref, variant.alt)
         panel_entry = clinvar_panel.get(_variant_key(variant), {})
-        clin_sig = panel_entry.get("clinical_significance", "")
-        variant.gt = _finalize_genotype(variant, clin_sig, pop_lookup)
-        if variant.gt == "0/0" and variant.alt_depth >= 1:
+        gt, _ = _gt_from_read_evidence_only(
+            variant.ref_depth,
+            variant.alt_depth,
+            variant.dp,
+            variant.af,
+            is_snp,
+            not is_snp,
+            ref=variant.ref,
+            alt=variant.alt,
+            clinical_significance=str(panel_entry.get("clinical_significance", "")),
+            is_panel=bool(variant.is_panel),
+        )
+        if gt:
+            variant.gt = gt
+        elif variant.gt == "0/0" and variant.alt_depth >= EVIDENCE_MIN_ALT_DEPTH:
             variant.gt = "0/1"
 
 
@@ -1562,6 +2592,8 @@ def _prepare_submission_vcf(
     logger: Optional[Callable[[str], None]] = None,
     pop_lookup: Optional[PopulationAfLookup] = None,
     clinvar_panel: Optional[Dict[Tuple[str, int, str, str], Dict[str, str]]] = None,
+    bam_path: Optional[Path] = None,
+    region: str = DEFAULT_REGION,
 ) -> str:
     """Build a validator-safe submission VCF (reference-checked + bcftools norm -c x)."""
     log = logger or (lambda _msg: None)
@@ -1625,8 +2657,15 @@ def _prepare_submission_vcf(
         f"Submission VCF normalized: {len(validated)} validated -> "
         f"{len(normalized)} after bcftools norm -c x"
     )
-    if clinvar_panel is not None:
-        _refresh_variants_genotypes(normalized, clinvar_panel, pop_lookup)
+    if bam_path is not None and bam_path.exists():
+        bam_path = Path(bam_path).resolve()
+        _ensure_bam_index(bam_path, threads=config.threads, logger=log)
+        log("Recomputing submission AD/AF/GT from BAM after final norm")
+        _recompute_submission_evidence_from_bam(
+            normalized, bam_path, config, region, config.reference_fasta
+        )
+    if pop_lookup is not None:
+        annotate_variants_with_population_af(normalized, pop_lookup)
     return _export_validator_safe_vcf(
         normalized,
         config.reference_fasta,
@@ -1953,6 +2992,126 @@ def _discover_mpileup_snps(
                         read_backed=_is_read_backed(ref_depth, alt_depth, dp),
                     )
                 )
+    return discovered
+
+
+_MPILEUP_INS_TOKEN_RE = re.compile(r"\+(\d+)([A-Za-z=]+)")
+
+
+def _decode_mpileup_insertion_bases(raw: str, length: int, anchor_base: str) -> str:
+    """Decode mpileup insertion token sequence (= matches anchor base)."""
+    bases: List[str] = []
+    anchor_upper = anchor_base.upper()
+    for char in raw:
+        if len(bases) >= length:
+            break
+        if char == "=":
+            bases.append(anchor_upper)
+        elif char in "ACGTacgt":
+            bases.append(char.upper())
+    return "".join(bases)
+
+
+def _discover_mpileup_indels(
+    bam_path: Path,
+    reference_fasta: Path,
+    region: str,
+    config: CftrMinerConfig,
+) -> List[VariantRecord]:
+    """Discover insertion candidates from samtools mpileup indel tokens (+Nseq)."""
+    region_chrom, start, end = _parse_region_bounds(region)
+    region_chrom = _vcf_chrom(region_chrom)
+    mpileup_cmd = [
+        "samtools",
+        "mpileup",
+        "-f",
+        str(reference_fasta),
+        "-r",
+        f"{region_chrom}:{start}-{end}",
+        "-Q",
+        str(config.min_baseq),
+        "-q",
+        str(config.min_mapq),
+        str(bam_path),
+    ]
+    try:
+        completed = subprocess.run(
+            mpileup_cmd, check=True, text=True, capture_output=True
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"Failed to run samtools mpileup indel discovery: {exc.stderr.strip()}"
+        ) from exc
+
+    insertion_hits: Dict[Tuple[int, str, str], int] = {}
+    for line in completed.stdout.splitlines():
+        if not line.strip() or "+" not in line:
+            continue
+        fields = line.split("\t")
+        if len(fields) < 5:
+            continue
+        read_bases = fields[4]
+        if read_bases.count("+") < 2:
+            continue
+        pos = int(fields[1])
+        ref_base = fields[2].upper()
+        for match in _MPILEUP_INS_TOKEN_RE.finditer(read_bases):
+            ins_len = int(match.group(1))
+            ins_seq = _decode_mpileup_insertion_bases(
+                match.group(2), ins_len, ref_base
+            )
+            if not ins_seq:
+                continue
+            ref_allele = ref_base
+            alt_allele = ref_base + ins_seq
+            if not _is_valid_allele(ref_allele) or not _is_valid_allele(alt_allele):
+                continue
+            if (
+                len(ref_allele) > MAX_SUBMISSION_ALLELE_LEN
+                or len(alt_allele) > MAX_SUBMISSION_ALLELE_LEN
+            ):
+                continue
+            insertion_hits[(pos, ref_allele, alt_allele)] = (
+                insertion_hits.get((pos, ref_allele, alt_allele), 0) + 1
+            )
+
+    discovered: List[VariantRecord] = []
+    with pysam.AlignmentFile(str(bam_path), "rb") as bam:
+        contig = _resolve_bam_contig(bam, region_chrom)
+        if contig is None:
+            return discovered
+        for (pos, ref_allele, alt_allele), token_hits in insertion_hits.items():
+            if token_hits < 2:
+                continue
+            if len(alt_allele) - len(ref_allele) > 3:
+                continue
+            ref_depth, alt_depth, dp, af = count_allele_support_with_pysam(
+                bam, contig, pos, ref_allele, alt_allele
+            )
+            min_af = EVIDENCE_MIN_AF
+            if len(alt_allele) == len(ref_allele) + 1 and token_hits >= 2:
+                min_af = 0.10
+            if alt_depth < 2 or dp < config.min_dp or af < min_af:
+                continue
+            discovered.append(
+                VariantRecord(
+                    chrom=_vcf_chrom(contig),
+                    pos=pos,
+                    ref=ref_allele,
+                    alt=alt_allele,
+                    qual=None,
+                    filter_value="PASS",
+                    gt=infer_gt_from_depth(
+                        ref_depth, alt_depth, ref=ref_allele, alt=alt_allele
+                    ),
+                    dp=dp,
+                    ref_depth=ref_depth,
+                    alt_depth=alt_depth,
+                    af=af,
+                    source="mpileup_indel_discovery",
+                    read_backed=_is_read_backed(ref_depth, alt_depth, dp),
+                )
+            )
     return discovered
 
 
@@ -3007,6 +4166,10 @@ def _load_panel_variants_in_region(
                     continue
                 key = (chrom_core(chrom), position, ref, alt)
                 if key in seen:
+                    continue
+                if not _is_submission_sized_allele(ref) or not _is_submission_sized_allele(
+                    alt
+                ):
                     continue
                 seen.add(key)
                 variants.append(

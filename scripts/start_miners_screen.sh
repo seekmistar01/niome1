@@ -8,7 +8,7 @@ GATK="${NIOME_GATK:-/root/manualtest_55/gatk-4.6.2.0/gatk}"
 CALLER="${NIOME_CALLER:-gatk}"
 
 cd "$ROOT"
-mkdir -p logs
+mkdir -p logs/newlogs
 
 pkill -f "neurons/miner.py --netuid 55" 2>/dev/null || true
 sleep 2
@@ -17,27 +17,28 @@ sleep 2
 
 start_one() {
   local name="$1"
-  shift
+  local instance="$2"
+  shift 2
   screen -dmS "$name" bash -lc \
-    "cd $ROOT && export PYTHONPATH=\$(pwd) NIOME_GATK=$GATK NIOME_CALLER=$CALLER && exec $PY neurons/miner.py $* >> logs/${name}.log 2>&1"
+    "cd $ROOT && export PYTHONPATH=\$(pwd) NIOME_GATK=$GATK NIOME_CALLER=$CALLER MINER_INSTANCE=$instance && exec $PY neurons/miner.py $* >> logs/${name}.log 2>&1"
 }
 
-start_one niome_m1 \
+start_one niome_m1 niome_m1 \
   --netuid 55 --subtensor.network finney \
   --wallet.name seekmistar001 --wallet.hotkey seekmistar01 \
   --axon.port 20051 --logging.info
 
-start_one niome_m2 \
+start_one niome_m2 niome_m2 \
   --netuid 55 --subtensor.network finney \
   --wallet.name seekmistar001 --wallet.hotkey seekmistar02 \
   --axon.port 20056 --logging.info
 
-start_one niome_m3 \
+start_one niome_m3 niome_m3 \
   --netuid 55 --subtensor.network finney \
   --wallet.name seekmistar001 --wallet.hotkey seekmistar03 \
   --axon.port 20054 --logging.info
 
-start_one niome_m4 \
+start_one niome_m4 niome_m4 \
   --netuid 55 --subtensor.network finney \
   --wallet.name seekmistar3 --wallet.hotkey seekmistar01 \
   --axon.port 20050 --logging.info

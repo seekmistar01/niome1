@@ -18,6 +18,7 @@ import os
 import sys
 import hashlib
 import time
+from pathlib import Path
 from typing import Tuple
 
 import bittensor as bt
@@ -29,7 +30,10 @@ if PROJECT_ROOT not in sys.path:
 
 # import base miner class which takes care of most of the boilerplate
 from niome_subnet.base.miner import BaseMinerNeuron
-from niome_subnet.cftr_miner_logic import process_cftr_task_for_miner
+from niome_subnet.cftr_miner_logic import (
+    build_empty_miner_response,
+    process_cftr_task_for_miner,
+)
 from niome_subnet.protocol import GenomicsTaskSynapse
 
 bt.logging.on()
@@ -82,7 +86,11 @@ class Miner(BaseMinerNeuron):
 
         except Exception as e:
             bt.logging.error(f"Forward error: {e}")
-            synapse.error = str(e)
+            result = build_empty_miner_response(Path(PROJECT_ROOT))
+            synapse.vcf_content = result["vcf_content"]
+            synapse.cftr_annotations = result["cftr_annotations"]
+            synapse.elapsed_time = result["elapsed_time"]
+            synapse.signature = self._generate_signature(result["vcf_content"], 0.0)
             return synapse
 
         return synapse
