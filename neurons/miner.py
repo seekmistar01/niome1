@@ -78,6 +78,10 @@ class Miner(BaseMinerNeuron):
                 vcf_content = Path(synapse_path).read_text(encoding="utf-8")
             else:
                 vcf_content = result["vcf_content"]
+            if vcf_content != result.get("vcf_content", vcf_content):
+                bt.logging.warning(
+                    "Synapse VCF read from disk differs from pipeline buffer; using disk copy"
+                )
             variant_rows = sum(
                 1 for line in vcf_content.splitlines() if not line.startswith("#")
             )

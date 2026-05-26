@@ -170,6 +170,14 @@ reads/
 work/
 outputs/
 
+# GATK (install via scripts/setup_miner_env.sh)
+tools/gatk/gatk-4.6.2.0.zip
+tools/gatk/gatk-4.6.2.0/
+tools/gatk/gatk
+
+# Local btcli venv
+venv-btcli/
+
 # Local task scratch and files over GitHub's 100 MB limit
 tasks/New folder/
 **/ref.fa

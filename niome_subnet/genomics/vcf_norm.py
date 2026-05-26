@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 
 def ensure_reference_index(reference_fasta: Union[str, Path], *, require_bwa: bool = False) -> Path:
@@ -109,3 +109,32 @@ def _run(command: list[str], description: str) -> None:
         stdout = (exc.stdout or "").strip()
         details = stderr or stdout or f"exit code {exc.returncode}"
         raise RuntimeError(f"Failed to {description}: {details}") from exc
+
+
+def verify_vcf_for_validator_scoring(
+    vcf_text: str,
+    reference_fasta: Union[str, Path],
+    *,
+    work_dir: Optional[Union[str, Path]] = None,
+) -> None:
+    """Raise RuntimeError if validator scoring bcftools norm -c x would fail on this VCF."""
+    if not (vcf_text or "").strip():
+        return
+    ref_path = ensure_reference_index(reference_fasta)
+    base = Path(work_dir or Path.cwd() / "work" / "validator_vcf_check")
+    base.mkdir(parents=True, exist_ok=True)
+    draft = base / "miner.check.vcf"
+    norm_out = base / "miner.check.norm.vcf.gz"
+    draft.write_text(vcf_text, encoding="utf-8")
+    if norm_out.exists():
+        norm_out.unlink()
+    tbi = Path(f"{norm_out}.tbi")
+    if tbi.exists():
+        tbi.unlink()
+    try:
+        gz_path = preprocess_vcf(draft)
+        normalize_vcf(gz_path, ref_path, norm_out)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Miner VCF failed bcftools norm (validator would score 0): {exc}"
+        ) from exc

@@ -1,7 +1,8 @@
 """CFTR variant-calling workflow used by the subnet 55 miner.
 
 Read-evidence-first pipeline: FASTQ -> BAM -> GATK + pathogenic panel candidates ->
-normalize -> pileup evidence ->
+optional sensitive multi-caller strategy (bcftools, FreeBayes, weakscan; see
+``NIOME_USE_STRATEGY_AUTO``) -> normalize -> pileup evidence ->
 hard filter -> genotype from AD/AF only -> rank/select -> submission.
 
 gnomAD is used only for optional INFO (AF_ESP) and tie-breaking during ranking;
@@ -34,7 +35,12 @@ from niome_subnet.genomics.population_af import (
     info_af_esp,
 )
 from niome_subnet.genomics.reference_paths import ensure_canonical_reference
-from niome_subnet.genomics.vcf_norm import normalize_vcf, preprocess_vcf
+from niome_subnet.genomics.vcf_norm import (
+    normalize_vcf,
+    preprocess_vcf,
+    verify_vcf_for_validator_scoring,
+)
+from niome_subnet import strategy_auto
 
 
 DRUG_COLUMNS = (
@@ -100,6 +106,119 @@ class VariantRecord:
 EVIDENCE_MIN_DP = 3
 EVIDENCE_MIN_ALT_DEPTH = 2
 EVIDENCE_MIN_AF = 0.12
+
+# Sensitive multi-caller strategy (niome_subnet/strategy_auto.py) — NIOME allele imbalance.
+def _use_strategy_auto() -> bool:
+    return os.environ.get("NIOME_USE_STRATEGY_AUTO", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _strategy_preset() -> Dict[str, Any]:
+    name = os.environ.get("NIOME_STRATEGY_SENSITIVITY", "sensitive").strip().lower()
+    base = strategy_auto.SENSITIVITY_PRESETS.get(
+        name, strategy_auto.SENSITIVITY_PRESETS["sensitive"]
+    )
+    return dict(base)
+
+
+def _strategy_submit_top_n() -> int:
+    return max(1, _env_int("NIOME_STRATEGY_SUBMIT_TOP_N", 30))
+
+
+def _strategy_submit_allowlist() -> bool:
+    return os.environ.get("NIOME_STRATEGY_SUBMIT_ALLOWLIST", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _load_strategy_selected_key_set(work_dir: Path) -> Set[Tuple[str, int, str, str]]:
+    path = work_dir / "strategy_auto" / "rank" / "selected.keys.tsv"
+    if not path.exists():
+        return set()
+    keys: Set[Tuple[str, int, str, str]] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        keys.add(
+            (chrom_core(parts[0]), int(parts[1]), parts[2], parts[3])
+        )
+    return keys
+
+
+def _load_strategy_rank_table(
+    work_dir: Path,
+) -> Tuple[List[Tuple[str, int, str, str]], Dict[Tuple[str, int, str, str], str]]:
+    """Rank-ordered keys and GT from strategy_auto ranked_candidates.tsv."""
+    path = work_dir / "strategy_auto" / "rank" / "ranked_candidates.tsv"
+    if not path.exists():
+        return [], {}
+    ordered: List[Tuple[str, int, str, str]] = []
+    gt_map: Dict[Tuple[str, int, str, str], str] = {}
+    with path.open(encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        for row in reader:
+            key = (
+                chrom_core(row["CHROM"]),
+                int(row["POS"]),
+                row["REF"],
+                row["ALT"],
+            )
+            ordered.append(key)
+            gt = (row.get("GT") or "").strip()
+            if gt and gt not in (".", "./."):
+                gt_map[key] = _normalize_submission_gt(gt) or gt
+    return ordered, gt_map
+
+
+def _strategy_use_rank_gt() -> bool:
+    return os.environ.get("NIOME_STRATEGY_USE_RANK_GT", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _strategy_hybrid_hom_gt() -> bool:
+    return os.environ.get("NIOME_STRATEGY_HYBRID_HOM_GT", "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _apply_strategy_rank_genotypes(
+    variants: List[VariantRecord],
+    work_dir: Path,
+) -> None:
+    if not _strategy_use_rank_gt():
+        return
+    _, gt_map = _load_strategy_rank_table(work_dir)
+    for variant in variants:
+        rank_gt = gt_map.get(_variant_key(variant))
+        if rank_gt:
+            variant.gt = rank_gt
+        if variant.alt_depth >= 1:
+            safe_gt = _normalize_submission_gt(variant.gt or "")
+            if safe_gt is None:
+                variant.gt = "0/1"
+        if _strategy_hybrid_hom_gt():
+            is_snp = _is_snp(variant.ref, variant.alt)
+            af = float(variant.af or 0.0)
+            ad = int(variant.alt_depth or 0)
+            if is_snp and ad >= 4 and af >= 0.85:
+                variant.gt = "1/1"
+            elif not is_snp and ad >= 3 and af >= 0.75:
+                variant.gt = "1/1"
+
+
 EVIDENCE_SNV_MIN_AF = 0.18
 EVIDENCE_INDEL_MIN_ALT_DEPTH = 3
 EVIDENCE_INDEL_MIN_AF = 0.20
@@ -299,6 +418,14 @@ def process_cftr_task_for_miner(
 
     log(f"CFTR miner task {task_id}: preparing reference indexes")
     _ensure_reference_indexes(config, log)
+    if _use_strategy_auto():
+        log(
+            f"CFTR miner task {task_id}: strategy_auto=on "
+            f"sensitivity={os.environ.get('NIOME_STRATEGY_SENSITIVITY', 'sensitive')} "
+            f"submit_top_n={_strategy_submit_top_n()} "
+            f"allowlist={int(_strategy_submit_allowlist())} "
+            f"rank_gt={int(_strategy_use_rank_gt())}"
+        )
 
     log(
         f"CFTR miner task {task_id}: aligning reads (bwa mem) and "
@@ -367,6 +494,7 @@ def process_cftr_task_for_miner(
         config.reference_fasta,
         clinvar_panel,
         log,
+        work_dir=work_dir,
     )
     accepted = [row for row in evidence_rows if row.evidence_status == "ACCEPTED"]
     rejected = len(evidence_rows) - len(accepted)
@@ -386,12 +514,21 @@ def process_cftr_task_for_miner(
         f"CFTR miner task {task_id}: ranking/selecting "
         f"(expected_variant_count={expected_variant_count})"
     )
-    selected_variants = _select_evidence_ranked_variants(
-        accepted,
-        expected_variant_count,
-        pop_lookup,
-        log,
-    )
+    if _use_strategy_auto():
+        selected_variants = _select_strategy_aligned_variants(
+            evidence_rows,
+            work_dir,
+            expected_variant_count,
+            pop_lookup,
+            log,
+        )
+    else:
+        selected_variants = _select_evidence_ranked_variants(
+            accepted,
+            expected_variant_count,
+            pop_lookup,
+            log,
+        )
 
     evidence_tsv = output_dir / "candidate_evidence.tsv"
     _write_candidate_evidence_tsv(evidence_tsv, evidence_rows)
@@ -408,21 +545,27 @@ def process_cftr_task_for_miner(
         bam_path=evidence_bam,
         region=region,
     )
-    vcf_lines = vcf_content.splitlines()
-    if vcf_lines:
-        vcf_lines.insert(
-            1,
-            f"##niome_task_id={task_id}",
+    try:
+        verify_vcf_for_validator_scoring(
+            vcf_content,
+            config.reference_fasta,
+            work_dir=work_dir / "validator_vcf_check",
         )
-        vcf_lines.insert(2, f"##niome_instance={_miner_instance_id()}")
-        vcf_content = "\n".join(vcf_lines) + "\n"
+    except Exception as exc:
+        log(f"WARNING: synapse VCF failed validator norm pre-check: {exc}")
+
     vcf_path = output_dir / "submission.vcf"
     synapse_vcf_path = output_dir / "synapse.vcf"
     output_lock = output_dir / ".submission.write.lock"
     with open(output_lock, "w", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        vcf_path.write_text(vcf_content, encoding="utf-8")
+        # Synapse wire format: exact validator-safe VCF from pipeline (no extra headers).
         synapse_vcf_path.write_text(vcf_content, encoding="utf-8")
+        vcf_lines = vcf_content.splitlines()
+        if vcf_lines:
+            vcf_lines.insert(1, f"##niome_task_id={task_id}")
+            vcf_lines.insert(2, f"##niome_instance={_miner_instance_id()}")
+        vcf_path.write_text("\n".join(vcf_lines) + "\n", encoding="utf-8")
 
     cftr_annotations = _build_cftr_annotations(
         selected_variants,
@@ -1076,19 +1219,28 @@ def _gt_from_read_evidence_only(
     is_panel: bool = False,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Evidence filter + GT from BAM AD/AF (GT uses validator-aligned infer_gt_from_depth)."""
-    if alt_depth < EVIDENCE_MIN_ALT_DEPTH:
+    min_alt_depth = EVIDENCE_MIN_ALT_DEPTH
+    if _use_strategy_auto():
+        min_alt_depth = max(1, _env_int("NIOME_EVIDENCE_MIN_ALT_DEPTH", 1))
+    if alt_depth < min_alt_depth:
         return None, "reject_alt_depth_lt_2"
     if dp < EVIDENCE_MIN_DP:
         return None, "reject_dp_lt_3"
     min_af = EVIDENCE_MIN_AF
+    if _use_strategy_auto():
+        min_af = min(min_af, _env_float("NIOME_EVIDENCE_MIN_AF", 0.08))
     if relaxed_indel and is_indel and alt_depth >= 2:
         min_af = min(min_af, 0.10)
     if panel_backed and is_indel and alt_depth >= 2:
         min_af = min(min_af, 0.10)
+    if _use_strategy_auto() and panel_backed and alt_depth >= min_alt_depth:
+        min_af = min(min_af, 0.05)
     if af < min_af:
         return None, "reject_af_lt_min"
 
     snv_min_af = EVIDENCE_SNV_MIN_AF
+    if _use_strategy_auto():
+        snv_min_af = min(snv_min_af, _env_float("NIOME_EVIDENCE_SNV_MIN_AF", 0.10))
     if primary_caller_count >= 2 and alt_depth >= 3:
         snv_min_af = min(snv_min_af, 0.15)
     if primary_caller_count >= 2 and alt_depth >= 4:
@@ -1096,7 +1248,12 @@ def _gt_from_read_evidence_only(
     if panel_backed and primary_caller_count >= 1 and alt_depth >= 3:
         snv_min_af = min(snv_min_af, 0.15)
 
-    if is_snp and af < snv_min_af and dp > EVIDENCE_LOW_DP_HET_MAX_DP:
+    if (
+        is_snp
+        and af < snv_min_af
+        and dp > EVIDENCE_LOW_DP_HET_MAX_DP
+        and not (_use_strategy_auto() and panel_backed and alt_depth >= min_alt_depth)
+    ):
         return None, "reject_snv_af_lt_0.18"
     if is_indel:
         if relaxed_indel and alt_depth >= 2 and af >= min_af:
@@ -1152,13 +1309,15 @@ def _gt_from_read_evidence_only(
         alt=alt,
         is_panel=is_panel or panel_backed,
     )
-    if panel_backed and is_snp and gt == "0/1":
-        sig = clinical_significance.lower().replace("_", " ")
-        if "pathogenic" in sig and "benign" not in sig:
-            if af >= 0.58 and alt_depth >= 5:
-                gt = "1/1"
-            elif af >= 0.52 and alt_depth >= 8:
-                gt = "1/1"
+    # Top leaderboard miners keep more hets under allele imbalance; avoid auto-hom upgrades.
+    if not _use_strategy_auto():
+        if panel_backed and is_snp and gt == "0/1":
+            sig = clinical_significance.lower().replace("_", " ")
+            if "pathogenic" in sig and "benign" not in sig:
+                if af >= 0.58 and alt_depth >= 5:
+                    gt = "1/1"
+                elif af >= 0.52 and alt_depth >= 8:
+                    gt = "1/1"
     if panel_backed and is_indel and gt == "0/1":
         sig = clinical_significance.lower().replace("_", " ")
         if "pathogenic" in sig and af >= 0.50 and alt_depth >= 4:
@@ -1310,6 +1469,102 @@ def _pathogenic_panel_entries_in_region(
     return filtered
 
 
+def _variant_from_strategy_selection(
+    chrom: str,
+    pos: int,
+    ref: str,
+    alt: str,
+    agg: Dict[str, Any],
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+) -> VariantRecord:
+    """Map strategy_auto ranked entry into a miner VariantRecord."""
+    dp = max(int(agg.get("max_dp") or 0), 1)
+    alt_d = max(int(agg.get("max_alt") or 0), 0)
+    ref_d = max(int(agg.get("max_ref") or 0), dp - alt_d)
+    af = alt_d / dp if dp else 0.0
+    families = agg.get("families") or set()
+
+    variant = VariantRecord(
+        chrom=_vcf_chrom(chrom),
+        pos=pos,
+        ref=ref,
+        alt=alt,
+        qual=float(agg.get("max_qual") or 0.0) or None,
+        filter_value="PASS",
+        gt=str(agg.get("best_gt") or "0/1"),
+        dp=dp,
+        ref_depth=ref_d,
+        alt_depth=alt_d,
+        af=af,
+        ad=f"{ref_d},{alt_d}",
+        source="strategy_auto",
+        read_backed=alt_d >= 1,
+    )
+    if "deepvariant" in families or "gatk" in families:
+        variant.source_gatk = True
+    if "bcftools" in families:
+        variant.source_bcftools = True
+    if "freebayes" in families or "weakscan" in families:
+        variant.source_assembly = True
+
+    panel_key = (chrom_core(chrom), pos, ref, alt)
+    panel_meta = clinvar_panel.get(panel_key)
+    if panel_meta or agg.get("clinvar"):
+        variant.is_panel = bool(panel_meta)
+        variant.source_panel_probe = bool(panel_meta)
+        if panel_meta:
+            variant.variation_id = str(panel_meta.get("variation_id", ""))
+    return variant
+
+
+def _merge_strategy_auto_candidates(
+    config: CftrMinerConfig,
+    bam_path: Path,
+    region: str,
+    work_dir: Path,
+    clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
+    pool: Dict[Tuple[str, int, str, str], VariantRecord],
+    paths: Dict[str, str],
+    gatk_plain: Path,
+    logger: Callable[[str], None],
+) -> None:
+    """Run sensitive multi-caller strategy and merge selected alleles into the pool."""
+    log = logger
+    preset = _strategy_preset()
+    run_dv = os.environ.get("NIOME_STRATEGY_DEEPVARIANT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    log(
+        f"Strategy auto: preset={os.environ.get('NIOME_STRATEGY_SENSITIVITY', 'sensitive')} "
+        f"deepvariant={run_dv}"
+    )
+    _ranked, selected, strat_paths = strategy_auto.run_for_miner_bam(
+        ref=str(config.reference_fasta),
+        bam=str(bam_path),
+        region=region,
+        work_dir=str(work_dir),
+        clinvar_panel=clinvar_panel,
+        preset=preset,
+        threads=config.threads,
+        logger=log,
+        gatk_plain_vcf=str(gatk_plain) if gatk_plain.exists() else None,
+        run_deepvariant=run_dv,
+        base_dir=str(config.base_dir),
+    )
+    paths.update({f"strategy_{k}": v for k, v in strat_paths.items()})
+    merged = 0
+    for _score, key, agg in selected:
+        chrom, pos, ref, alt = key
+        variant = _variant_from_strategy_selection(
+            chrom, pos, ref, alt, agg, clinvar_panel
+        )
+        _merge_candidate_into_pool(pool, variant)
+        merged += 1
+    log(f"Strategy auto merged {merged} selected allele(s) into candidate pool")
+
+
 def _collect_all_candidates(
     config: CftrMinerConfig,
     bam_path: Path,
@@ -1380,6 +1635,19 @@ def _collect_all_candidates(
                 _merge_candidate_into_pool(pool, variant)
                 probe_added += 1
             log(f"Panel probe contributed {probe_added} additional allele(s)")
+
+    if _use_strategy_auto():
+        _merge_strategy_auto_candidates(
+            config,
+            bam_path,
+            region,
+            work_dir,
+            clinvar_panel,
+            pool,
+            paths,
+            gatk_plain,
+            log,
+        )
 
     return list(pool.values()), paths
 
@@ -1638,9 +1906,13 @@ def _apply_evidence_engine(
     reference_fasta: Path,
     clinvar_panel: Dict[Tuple[str, int, str, str], Dict[str, str]],
     logger: Callable[[str], None],
+    work_dir: Optional[Path] = None,
 ) -> List[VariantRecord]:
     log = logger
     bam_path = Path(bam_path).resolve()
+    _, rank_gt_map = (
+        _load_strategy_rank_table(work_dir) if work_dir is not None else ([], {})
+    )
     log(f"Evidence engine opening BAM: {bam_path}")
     index_before = _find_bam_index_path(bam_path)
     log(
@@ -1709,7 +1981,38 @@ def _apply_evidence_engine(
             is_snp = _is_snp(variant.ref, variant.alt)
             is_indel = not is_snp
 
-            if hard_reason:
+            strategy_light_ok = (
+                _use_strategy_auto()
+                and variant.source == "strategy_auto"
+                and variant.ref_match
+                and alt_d >= 1
+                and hard_reason
+                not in (
+                    "reject_ref_mismatch",
+                    "reject_invalid_allele",
+                    "reject_outside_region",
+                    "reject_alt_depth_zero",
+                    "reject_af_zero",
+                )
+            )
+            if strategy_light_ok:
+                rank_gt = rank_gt_map.get(key)
+                if rank_gt:
+                    variant.gt = rank_gt
+                else:
+                    variant.gt = infer_gt_from_depth(
+                        ref_d,
+                        alt_d,
+                        str(panel_entry.get("clinical_significance", "")),
+                        ref=variant.ref,
+                        alt=variant.alt,
+                        is_panel=bool(variant.is_panel or panel_entry),
+                    )
+                    if af < 0.85:
+                        variant.gt = "0/1"
+                variant.evidence_status = "ACCEPTED"
+                variant.evidence_reason = "accepted_strategy_light"
+            elif hard_reason:
                 variant.evidence_status = "REJECTED"
                 variant.evidence_reason = hard_reason
             else:
@@ -1769,6 +2072,82 @@ def _gnomad_ranking_prior(
     if af_esp is None:
         return 0.0
     return float(af_esp)
+
+
+def _select_strategy_aligned_variants(
+    evidence_rows: List[VariantRecord],
+    work_dir: Path,
+    expected_variant_count: int,
+    pop_lookup: Optional[PopulationAfLookup],
+    logger: Callable[[str], None],
+) -> List[VariantRecord]:
+    """Build submission set aligned to strategy_auto top-N (matches ~0.90 leaderboard shape)."""
+    log = logger
+    top_n = _strategy_submit_top_n()
+    by_key = {_variant_key(v): v for v in evidence_rows}
+    accepted = [v for v in evidence_rows if v.evidence_status == "ACCEPTED"]
+    selected: List[VariantRecord] = []
+    seen: Set[Tuple[str, int, str, str]] = set()
+
+    if _strategy_submit_allowlist():
+        ranked_keys, _ = _load_strategy_rank_table(work_dir)
+        selected_keys = _load_strategy_selected_key_set(work_dir)
+        for key in ranked_keys:
+            if len(selected) >= top_n:
+                break
+            if key not in selected_keys:
+                continue
+            variant = by_key.get(key)
+            if variant is None:
+                continue
+            if variant.evidence_status != "ACCEPTED":
+                if variant.alt_depth < 1 or not variant.ref_match:
+                    continue
+                variant.evidence_status = "ACCEPTED"
+                variant.evidence_reason = "accepted_strategy_allowlist"
+                if variant.alt_depth >= 1:
+                    safe_gt = _normalize_submission_gt(variant.gt or "")
+                    if safe_gt is None:
+                        variant.gt = "0/1"
+            selected.append(variant)
+            seen.add(key)
+        log(
+            f"Strategy allowlist submission: {len(selected)} variant(s) from "
+            f"strategy_auto rank order (top {top_n})"
+        )
+    else:
+        selected = list(accepted)
+        seen = {_variant_key(v) for v in selected}
+
+    if len(selected) < top_n:
+        for variant in sorted(
+            accepted,
+            key=lambda item: (
+                -int(item.is_panel or item.source_panel_probe),
+                -_caller_support_count(item),
+                -item.evidence_score,
+                -item.alt_depth,
+                item.pos,
+            ),
+        ):
+            key = _variant_key(variant)
+            if key in seen:
+                continue
+            selected.append(variant)
+            seen.add(key)
+            if len(selected) >= top_n:
+                break
+
+    if expected_variant_count > 0 and len(selected) > expected_variant_count:
+        panel_first = [v for v in selected if v.is_panel or v.source_panel_probe]
+        other = [v for v in selected if v not in panel_first]
+        selected = (panel_first + other)[:expected_variant_count]
+
+    for variant in selected:
+        _gnomad_ranking_prior(variant, pop_lookup)
+    selected = _dedupe_variants_by_key(selected)
+    _apply_strategy_rank_genotypes(selected, work_dir)
+    return selected
 
 
 def _select_evidence_ranked_variants(
@@ -2243,24 +2622,28 @@ def _ensure_reference_indexes(
     """Build BWA/FAI/DICT indexes required by bwa mem and GATK."""
     log = logger or (lambda _msg: None)
     reference = config.reference_fasta
-    fai_path = Path(f"{reference}.fai")
-    if not fai_path.exists():
-        log(f"Indexing reference FASTA: {reference}")
-        _run_command(["samtools", "faidx", str(reference)], "index reference FASTA")
+    lock_path = config.base_dir / "data" / ".reference_index.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        fai_path = Path(f"{reference}.fai")
+        if not fai_path.exists():
+            log(f"Indexing reference FASTA: {reference}")
+            _run_command(["samtools", "faidx", str(reference)], "index reference FASTA")
 
-    bwa_suffixes = (".amb", ".ann", ".bwt", ".pac", ".sa")
-    if not all(Path(f"{reference}{suffix}").exists() for suffix in bwa_suffixes):
-        log(f"Building BWA index: {reference}")
-        _run_command(["bwa", "index", str(reference)], "build BWA index")
+        bwa_suffixes = (".amb", ".ann", ".bwt", ".pac", ".sa")
+        if not all(Path(f"{reference}{suffix}").exists() for suffix in bwa_suffixes):
+            log(f"Building BWA index: {reference}")
+            _run_command(["bwa", "index", str(reference)], "build BWA index")
 
-    dict_path = _reference_dict_path(reference)
-    if not dict_path.exists():
-        log(f"Creating sequence dictionary: {dict_path}")
-        _run_gatk(
-            config,
-            "CreateSequenceDictionary",
-            ["-R", str(reference), "-O", str(dict_path)],
-        )
+        dict_path = _reference_dict_path(reference)
+        if not dict_path.exists():
+            log(f"Creating sequence dictionary: {dict_path}")
+            _run_gatk(
+                config,
+                "CreateSequenceDictionary",
+                ["-R", str(reference), "-O", str(dict_path)],
+            )
 
 
 def _prepare_dedup_bam_from_reads(
@@ -2357,6 +2740,7 @@ def _call_gatk_haplotypecaller(
 
 
 def _align_reads(config: CftrMinerConfig, read1_path: Path, read2_path: Path, bam_path: Path) -> None:
+    _ensure_reference_indexes(config)
     bwa_cmd = [
         "bwa",
         "mem",
@@ -2589,7 +2973,14 @@ def _parse_submission_norm_vcf(
             key = (chrom_core(chrom), int(pos), ref, alt)
             pos_key = (chrom_core(chrom), int(pos))
             gt = gt_fallback.get(key)
-            if (not gt or gt in (".", "./.", "0/0")) and gt_pos_fallback:
+            use_pos_fallback = not (
+                _use_strategy_auto() and _strategy_use_rank_gt()
+            )
+            if (
+                use_pos_fallback
+                and (not gt or gt in (".", "./.", "0/0"))
+                and gt_pos_fallback
+            ):
                 gt = gt_pos_fallback.get(pos_key)
             if not gt or gt in (".", "./.", "0/0"):
                 gt = norm_gt if norm_gt not in (".", "./.", "0/0") else "0/1"
@@ -2622,7 +3013,8 @@ def _parse_submission_norm_vcf(
                 record.source_panel_probe = evidence.source_panel_probe
                 if record.af_esp is None:
                     record.af_esp = evidence.af_esp
-                record.gt = evidence.gt
+                if not (_use_strategy_auto() and _strategy_use_rank_gt()):
+                    record.gt = evidence.gt
             records.append(record)
     return _dedupe_variants_by_key(records)
 
@@ -2845,6 +3237,8 @@ def _prepare_submission_vcf(
             config.reference_fasta,
             clinvar_panel=clinvar_panel,
         )
+        if _use_strategy_auto():
+            _apply_strategy_rank_genotypes(normalized, work_dir)
     if pop_lookup is not None:
         annotate_variants_with_population_af(normalized, pop_lookup)
     return _export_validator_safe_vcf(
@@ -2913,13 +3307,22 @@ def _export_validator_safe_vcf(
                 f"Validator norm kept {len(safe_variants)}/{len(variants)} "
                 "variant(s) in final submission"
             )
-        return _build_submission_vcf(
+        final_vcf = _build_submission_vcf(
             safe_variants,
             reference_header,
             contig_id,
             contig_length,
             include_af_esp,
         )
+        try:
+            verify_vcf_for_validator_scoring(
+                final_vcf,
+                reference_fasta,
+                work_dir=work_dir / "validator_vcf_check",
+            )
+        except Exception as verify_exc:
+            log(f"WARNING: exported VCF failed validator norm check: {verify_exc}")
+        return final_vcf
     except Exception as exc:
         log(f"Validator export norm failed ({exc}); retrying per-variant")
         safe_variants = _norm_submission_variants_individually(
@@ -2932,13 +3335,22 @@ def _export_validator_safe_vcf(
             include_af_esp,
             logger=log,
         )
-        return _build_submission_vcf(
+        final_vcf = _build_submission_vcf(
             safe_variants,
             reference_header,
             contig_id,
             contig_length,
             include_af_esp,
         )
+        try:
+            verify_vcf_for_validator_scoring(
+                final_vcf,
+                reference_fasta,
+                work_dir=work_dir / "validator_vcf_check",
+            )
+        except Exception as verify_exc:
+            log(f"WARNING: per-variant export failed validator norm check: {verify_exc}")
+        return final_vcf
 
 
 def _parse_vcf_records(vcf_path: Path, source: str) -> List[VariantRecord]:

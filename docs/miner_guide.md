@@ -71,26 +71,74 @@ You must create a Bittensor wallet to hold your TAO and Alpha tokens, and to reg
    btcli subnet register --netuid 55 --wallet.name your_coldkey --wallet.hotkey your_hotkey
    ```
 
-### 4. Running the Miner
+### 4. Install miner tools and reference data
 
-Once your hotkey is registered, you can start your Miner. 
+From the project root:
 
-1. **Run the Miner Script:** The core command to launch a miner neuron requires specifying your wallet and hotkey names, the network, and the subnet ID (`--netuid 55`).
-   
-   In your current subnet-niome project path
+```bash
+bash scripts/setup_miner_env.sh
+bash scripts/verify_miner_env.sh
+```
 
-   **Bash**
-   ```
-   export PYTHONPATH="$PYTHONPATH:$(pwd)                                                               
-   ```
+This installs `bwa`, `samtools`, `bcftools`, `tabix`, `screen`, Java, GATK 4.6.2.0, a Python venv with `requirements.txt`, and downloads/indexes `data/chr7.fa` (GRCh38).
 
-   ```
-   python neurons/miner.py \
-   --netuid 55 \
-   --subtensor.network finney \
-   --wallet.name your_coldkey \
-   --wallet.hotkey your_hotkey \
-   --axon.port your_port
-   ```
+### 5. Sensitive multi-caller strategy (recommended)
 
-3. **Keep it Running:** Use a process manager like **`pm2`** or **`tmux`** to ensure your miner remains active and online, as Validators reward only active, responsive miners.
+The miner uses `niome_subnet/strategy_auto.py` by default for NIOME’s low-coverage,
+allele-imbalance simulation (15–85% haplotype fractions). It adds bcftools, FreeBayes
+(Docker), and a MAPQ-relaxed weak scanner on top of GATK + ClinVar panel probes.
+
+Environment variables (optional):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `NIOME_USE_STRATEGY_AUTO` | `1` | Set `0` to disable strategy merge |
+
+Live miners load these from `scripts/miner_env.sh` (sourced by `scripts/start_miners_screen.sh`). Restart after code changes:
+
+```bash
+bash scripts/restart_miners.sh
+```
+| `NIOME_STRATEGY_SENSITIVITY` | `sensitive` | `balanced`, `sensitive`, or `aggressive` |
+| `NIOME_STRATEGY_SUBMIT_TOP_N` | `30` | Cap strategy-aligned submission size |
+| `NIOME_STRATEGY_SUBMIT_ALLOWLIST` | `1` | Submit from strategy rank order (selected set) |
+| `NIOME_STRATEGY_USE_RANK_GT` | `1` | Use GT from `ranked_candidates.tsv` in submission |
+| `NIOME_STRATEGY_HYBRID_HOM_GT` | `1` | Upgrade to `1/1` when BAM AF supports hom (validator GT score) |
+| `NIOME_STRATEGY_DEEPVARIANT` | `0` | Set `1` to also run DeepVariant in Docker |
+| `NIOME_EVIDENCE_MIN_ALT_DEPTH` | `1` | Min alt reads when strategy is on |
+| `NIOME_EVIDENCE_MIN_AF` | `0.08` | Min allele fraction for evidence |
+| `NIOME_EVIDENCE_SNV_MIN_AF` | `0.10` | SNV AF floor with strategy on |
+
+Strategy artifacts are written under `work/<task>/<instance>/strategy_auto/`.
+
+### 6. Running the Miner
+
+Once your hotkey is registered, you can start your Miner.
+
+**Single miner:**
+
+```bash
+export PYTHONPATH="$(pwd)"
+export NIOME_GATK="$(pwd)/tools/gatk/gatk"
+./venv/bin/python neurons/miner.py \
+  --netuid 55 \
+  --subtensor.network finney \
+  --wallet.name your_coldkey \
+  --wallet.hotkey your_hotkey \
+  --axon.port 50007 \
+  --logging.info
+```
+
+**Four miners in screen** (set wallet coldkeys before starting):
+
+```bash
+export NIOME_WALLET_MAIN=your_coldkey
+export NIOME_WALLET_ALT=your_other_coldkey   # optional, default seekmistar3
+bash scripts/start_miners_screen.sh
+```
+
+Use **`screen -r niome_m1`** (etc.) to attach to a session.
+
+### 7. Keep it Running
+
+Validators reward only active, responsive miners. Use `screen`, `tmux`, or `pm2` so processes survive disconnects.

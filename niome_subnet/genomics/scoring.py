@@ -38,6 +38,14 @@ def normalize_gt(gt_tuple):
     return tuple(sorted(a if a is not None else -1 for a in gt_tuple))
 
 
+def _scoring_contig(contig: str) -> str:
+    """Normalize contig names so chr7 and 7 match after bcftools norm."""
+    value = (contig or "").strip()
+    if value.lower().startswith("chr"):
+        return value if value.startswith("chr") else f"chr{value[3:]}"
+    return f"chr{value}"
+
+
 def load_vcf(path):
     vcf = pysam.VariantFile(path)
     variants = {}  # (contig, pos, ref, alt) -> normalized GT tuple or None
@@ -46,7 +54,7 @@ def load_vcf(path):
         if rec.alts is None:
             continue
         for alt in rec.alts:
-            key = (rec.contig, rec.pos, rec.ref, alt)
+            key = (_scoring_contig(rec.contig), rec.pos, rec.ref, alt)
             gt = None
             try:
                 sample = next(iter(rec.samples.values()))
