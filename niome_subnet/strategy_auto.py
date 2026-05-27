@@ -11,6 +11,8 @@ import re
 import subprocess
 import shutil
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import defaultdict
 
@@ -1017,7 +1019,7 @@ def run_for_miner_bam(
     threads: int = 8,
     logger=None,
     gatk_plain_vcf: str = None,
-    run_deepvariant: bool = False,
+    enable_deepvariant: bool = False,
     base_dir: str = None,
 ):
     """Run multi-caller sensitive strategy on an existing miner BAM (no re-alignment).
@@ -1049,25 +1051,49 @@ def run_for_miner_bam(
             normalize_vcf(raw_gz, ref, gatk_gz)
         vcfs.append(gatk_gz)
 
-    if run_deepvariant and have("docker") and base_dir:
-        dv = run_deepvariant(base_dir, ref, bam, region, calls_dir, threads, preset)
-        if dv:
-            vcfs.append(dv)
-
     bam_label = Path(bam).stem.replace(".bam", "")
-    bc = run_bcftools(ref, bam, region, f"{calls_dir}/bcftools.{bam_label}", preset)
-    vcfs.append(bc)
 
-    fb = run_freebayes(ref, bam, region, f"{calls_dir}/freebayes.{bam_label}", preset)
-    if fb:
-        vcfs.append(fb)
+    def _run_dv():
+        return run_deepvariant(base_dir, ref, bam, region, calls_dir, threads, preset)
 
-    weak_raw = f"{custom_dir}/weakscan.raw.vcf"
-    weak_scan(ref, region, [bam], weak_raw, preset)
-    weak_gz = bgzip_tabix(weak_raw)
-    weak_norm = f"{calls_dir}/weakscan.miner.norm.vcf.gz"
-    normalize_vcf(weak_gz, ref, weak_norm)
-    vcfs.append(weak_norm)
+    def _run_bc():
+        return run_bcftools(ref, bam, region, f"{calls_dir}/bcftools.{bam_label}", preset)
+
+    def _run_fb():
+        return run_freebayes(ref, bam, region, f"{calls_dir}/freebayes.{bam_label}", preset)
+
+    def _run_ws():
+        weak_raw = f"{custom_dir}/weakscan.raw.vcf"
+        weak_scan(ref, region, [bam], weak_raw, preset)
+        weak_gz = bgzip_tabix(weak_raw)
+        weak_norm = f"{calls_dir}/weakscan.miner.norm.vcf.gz"
+        normalize_vcf(weak_gz, ref, weak_norm)
+        return weak_norm
+
+    jobs = {}
+    if enable_deepvariant and have("docker") and base_dir:
+        jobs["dv"] = _run_dv
+    jobs["bc"] = _run_bc
+    jobs["fb"] = _run_fb
+    jobs["ws"] = _run_ws
+
+    parallel_start = time.perf_counter()
+    futures = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        for name, fn in jobs.items():
+            futures[name] = pool.submit(fn)
+        for name, fut in futures.items():
+            try:
+                result = fut.result()
+            except Exception as exc:
+                _log(f"Strategy caller {name} failed: {exc}")
+                continue
+            if result:
+                vcfs.append(result)
+    _log(
+        f"Strategy callers ({','.join(jobs.keys())}) finished in "
+        f"{time.perf_counter() - parallel_start:.2f}s"
+    )
 
     agg = load_candidates(vcfs, clinvar_keys)
     ranked = [(rank_score(key, a), key, a) for key, a in agg.items()]

@@ -192,3 +192,5 @@ tasks/New folder/
 # Editors
 .vscode/settings.json
 .idea
+# Benchmark / training data (large, sensitive truth.vcf)
+realdata/
